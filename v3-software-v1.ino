@@ -74,10 +74,7 @@ float tecOutputPower = 0.0;
 float tecPIDProportional = 4.5;
 float tecPIDIntegral = 1.0;
 float tecPIDDerivative = 0.5;
-float tecTempMin = 0.0;
-float tecTempMax = 60.0;
 bool tecConnected = false;
-bool tecPowerOn = false;
 bool tecOpenCollector = false;
 bool levelShifterEnabled = false;
 float supply3V3 = 0.0;
@@ -436,45 +433,45 @@ void refreshPage(int page) {
       float pw = tecOutputPower;
       int oc = tecOpenCollector ? 1 : 0;
       
-      // Line 0: Temperatures (Tz and Tr)
+      // Line 0: Temperatures (Tz) on left, P on right (20 chars total)
       lcd.setCursor(0, 0);
-      char tzBuf[6], trBuf[6];
+      char tzBuf[6], pBuf[6];
       formatNumber(tz, tzBuf, 5);
-      formatNumber(tr, trBuf, 5);
-      lcd.print("Tz=");
+      formatNumber(tecPIDProportional, pBuf, 5);
+      lcd.print(" Tz=");
       lcd.print(tzBuf);
+      lcd.print("  P =");
+      lcd.print(pBuf);
+      lcd.print(" "); // Clear rest of line
+      
+      // Line 1: Temperature (Tr) on left, I on right (20 chars total)
+      lcd.setCursor(0, 1);
+      char trBuf[6], iBuf[6];
+      formatNumber(tr, trBuf, 5);
+      formatNumber(tecPIDIntegral, iBuf, 5);
       lcd.print(" Tr=");
       lcd.print(trBuf);
-      lcd.print("    "); // Clear rest of line
-      
-      // Line 1: PID P and I (with 2 decimal places)
-      lcd.setCursor(0, 1);
-      char pBuf[6], iBuf[6];
-      formatNumber(tecPIDProportional, pBuf, 5);
-      formatNumber(tecPIDIntegral, iBuf, 5);
-      lcd.print("P =");
-      lcd.print(pBuf);
-      lcd.print(" I =");
+      lcd.print("  I =");
       lcd.print(iBuf);
-      lcd.print("   "); // Clear rest of line
+      lcd.print(" "); // Clear rest of line
       
       // Line 2: PID D only
       lcd.setCursor(0, 2);
       char dBuf[6];
       formatNumber(tecPIDDerivative, dBuf, 5);
-      lcd.print("D =");
+      lcd.print("           D =");
       lcd.print(dBuf);
-      lcd.print("          "); // Clear rest of line
+      lcd.print(" "); // Clear rest of line
       
       // Line 3: Power and Open Collector
       lcd.setCursor(0, 3);
       char pwBuf[5];
       formatNumber(pw, pwBuf, 4);
-      lcd.print("PW=");
+      lcd.print(" PW=");
       lcd.print(pwBuf);
-      lcd.print("  OC=");
+      lcd.print("   OC=");
       lcd.print(oc);
-      lcd.print("      "); // Clear rest of line
+      lcd.print("    "); // Clear rest of line
       
     } else {
       // Level shifter enabled but no TEC response
@@ -618,60 +615,13 @@ void readTECController() {
     tecFailCount = 0;
     rawTecResponse = response; // Store raw response
     
-    // Show raw TEC response in serial monitor
-    Serial.print(F("TEC RAW: '"));
-    Serial.print(response);
-    Serial.println(F("'"));
+    // Store raw response for display (debug output reduced)
     
     String cleanResponse = response;
     cleanResponse.trim();
     
-    // Check if this is Advanced format (angle brackets)
-    if (cleanResponse.startsWith("<") && cleanResponse.endsWith(">")) {
-      // Advanced format: <Tsetpoint P I D Tmin Tmax Tmeasured OC PWM>
-      cleanResponse = cleanResponse.substring(1, cleanResponse.length() - 1);
-      
-      float values[9];
-      int valueCount = 0;
-      int startPos = 0;
-      
-      for (int i = 0; i < 9 && valueCount < 9; i++) {
-        int spacePos = cleanResponse.indexOf(' ', startPos);
-        String valueStr = (spacePos == -1) ? cleanResponse.substring(startPos) : 
-                         cleanResponse.substring(startPos, spacePos);
-        
-        if (valueStr.length() > 0) {
-          values[valueCount++] = valueStr.toFloat();
-        }
-        if (spacePos == -1) break;
-        startPos = spacePos + 1;
-      }
-      
-      if (valueCount >= 9) {
-        tecSetTemp = values[0];
-        tecPIDProportional = values[1];
-        tecPIDIntegral = values[2];
-        tecPIDDerivative = values[3];
-        tecTempMin = values[4];
-        tecTempMax = values[5];
-        tecActualTemp = values[6];
-        tecOpenCollector = (values[7] > 0.5);
-        tecOutputPower = values[8];
-        tecPowerOn = (abs(tecOutputPower) > 0.1);
-        
-        Serial.println(F("TEC: Advanced format OK"));
-      } else {
-        Serial.print(F("TEC: Advanced incomplete, got "));
-        Serial.print(valueCount);
-        Serial.println(F(" values"));
-      }
-    } 
-    else {
-      // Basic format: Tz=25.01 P=5.09 I=2.02 D=1.01 Tr=25.72 OC=0 PW=100
-      bool parsed = false;
-      
-      // Look for key=value pairs
-      if (cleanResponse.indexOf("Tz=") != -1) {
+    // Parse Basic format: Tz=25.01 P=5.09 I=2.02 D=1.01 Tr=25.72 OC=0 PW=100
+    if (cleanResponse.indexOf("Tz=") != -1) {
         int pos;
         
         // Parse temperature setpoint (Tz)
@@ -734,28 +684,19 @@ void readTECController() {
           if (end == -1) end = cleanResponse.length();
           tecOpenCollector = (cleanResponse.substring(pos, end).toFloat() > 0.5);
         }
-        
-        tecPowerOn = (abs(tecOutputPower) > 0.1);
-        parsed = true;
-        Serial.println(F("TEC: Basic format OK"));
-      }
-      
-      if (!parsed) {
+      } else {
         Serial.print(F("TEC: Unknown format: '"));
         Serial.print(cleanResponse);
         Serial.println(F("'"));
       }
-    }
     
-    // Show parsed values (only occasionally to avoid spam)
+    // Show connection status only when re-connecting after failures
     if (tecFailCount > 0) {
-      Serial.print(F("TEC: CONNECTED! Set="));
+      Serial.print(F("TEC: Connected! Set="));
       Serial.print(tecSetTemp, 1);
       Serial.print(F("°C Act="));
       Serial.print(tecActualTemp, 1);
-      Serial.print(F("°C PWM="));
-      Serial.print(tecOutputPower, 1);
-      Serial.println(F("%"));
+      Serial.println(F("°C"));
     }
     
   } else {
@@ -769,65 +710,13 @@ void readTECController() {
        Serial.print(tecFailCount);
        Serial.println(F(" consecutive failures)"));
      } else if (tecFailCount % 20 == 0) {
-       // Run diagnostics every 20 failures (less frequent)
+       // Report failure count every 20 failures
        Serial.print(F("TEC: Still no response ("));
        Serial.print(tecFailCount);
        Serial.println(F(" failures)"));
-       diagnoseTECConnection();
      }
   }
 }
 
-// Note: TEC control functions removed - using hardware trimmers for control
-// This code only monitors TEC status via UART (read-only)
 
 
-
-// Function to diagnose TEC connection issues
-void diagnoseTECConnection() {
-  Serial.println(F("\n=== TEC DIAGNOSTICS ==="));
-  
-  // Check level shifter enable pin
-  Serial.print(F("Level Shifter OE (D9): "));
-  Serial.println(digitalRead(oePin) ? "ENABLED" : "DISABLED");
-  
-  // Check 3.3V supply voltage
-  int analogValue = analogRead(voltageCheckPin);
-  float voltage = (analogValue * 5.0) / 1023.0;
-  Serial.print(F("3.3V Supply (A1): "));
-  Serial.print(voltage, 2);
-  Serial.print(F("V - "));
-  if (voltage >= 2.97 && voltage <= 3.63) {
-    Serial.println(F("OK"));
-  } else {
-    Serial.println(F("OUT OF RANGE"));
-  }
-  
-  // Check TEC communication pins
-  Serial.print(F("TEC RX Pin (D")); Serial.print(TEC_RX_PIN); Serial.print(F("): "));
-  pinMode(TEC_RX_PIN, INPUT_PULLUP);
-  delay(10);
-  Serial.println(digitalRead(TEC_RX_PIN) ? "HIGH" : "LOW");
-  
-  Serial.print(F("TEC TX Pin (D")); Serial.print(TEC_TX_PIN); Serial.print(F("): "));
-  Serial.println(digitalRead(TEC_TX_PIN) ? "HIGH" : "LOW");
-  
-  // Check TEC connection status
-  Serial.print(F("TEC Connected: "));
-  Serial.println(tecConnected ? "YES" : "NO");
-  
-  Serial.print(F("Consecutive Failures: "));
-  Serial.println(tecFailCount);
-  
-  // Restore normal operation
-  if (levelShifterEnabled) {
-    digitalWrite(oePin, HIGH);
-    if (!mySerial) {
-      mySerial.begin(38400);
-    }
-  } else {
-    digitalWrite(oePin, LOW);
-  }
-  
-  Serial.println(F("=== END DIAGNOSTICS ===\n"));
-}
