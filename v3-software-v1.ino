@@ -71,16 +71,23 @@ const unsigned long refreshInterval = 500; // ms
 float tecActualTemp = 0.0;
 float tecSetTemp = 0.0;
 float tecOutputPower = 0.0;
+float tecPIDProportional = 4.5;
+float tecPIDIntegral = 1.0;
+float tecPIDDerivative = 0.5;
+float tecTempMin = 0.0;
+float tecTempMax = 60.0;
 bool tecConnected = false;
 bool tecPowerOn = false;
+bool tecOpenCollector = false;
 bool levelShifterEnabled = false;
 float supply3V3 = 0.0;
 unsigned long lastTecRead = 0;
 const unsigned long tecReadInterval = 2000; // Read every 2 seconds
 int tecFailCount = 0; // Counter for failed TEC communications
 
-// Thermistor calculation constant
-const float beta = 3375.0;
+// Thermistor calculation constants
+const float beta = 3375.0;        // For laser diode thermistor
+// Note: TEC controller uses 10k NTC thermistor with beta=3950 (per datasheet)
 
 #define averageLastN 10
 
@@ -226,7 +233,7 @@ void checkSupplyVoltage() {
     if (!levelShifterEnabled) {
       // Enable level shifter
       digitalWrite(oePin, HIGH);
-      delay(10); // Small delay for level shifter to stabilize
+      delay(5); // Reduced from 10ms to 5ms for level shifter to stabilize
       
       // Now safe to start software serial
       mySerial.begin(38400);
@@ -236,10 +243,8 @@ void checkSupplyVoltage() {
       Serial.print(supply3V3, 2);
       Serial.println(F("V - Level shifter enabled"));
       
-      // Test different baud rates to find working TEC communication
-      delay(500); // Give TEC time to stabilize
-      diagnoseTECConnection(); // Run diagnostics first
-      tryTECBaudRates();
+      // Start TEC communication at specified 38400 baud (per datasheet)
+      delay(100); // Allow TEC to stabilize
     }
   } else {
     if (levelShifterEnabled) {
@@ -439,7 +444,7 @@ void refreshPage(int page) {
     } else if (tecConnected) {
       // TEC connected - show detailed info
       
-      // Line 1: Temperatures
+      // Line 1: Temperatures with open collector status
       lcd.setCursor(0, 1);
       lcd.print("Act:");
       formatNumber(tecActualTemp, buf, 4);
@@ -447,17 +452,17 @@ void refreshPage(int page) {
       lcd.print(" Set:");
       formatNumber(tecSetTemp, buf, 4);
       lcd.print(buf);
-      lcd.print("C");
+      lcd.print(tecOpenCollector ? "!C" : "C");  // '!' if OC active
       
-      // Line 2: Power output
+      // Line 2: Power output with direction
       lcd.setCursor(0, 2);
       if (tecPowerOn) {
         if (tecOutputPower > 0) {
-          lcd.print("Heat: ");
+          lcd.print("Heat:");
           formatNumber(tecOutputPower, buf, 5);
           lcd.print(buf); lcd.print("%        ");
         } else if (tecOutputPower < 0) {
-          lcd.print("Cool: ");
+          lcd.print("Cool:");
           formatNumber(-tecOutputPower, buf, 5);
           lcd.print(buf); lcd.print("%        ");
         } else {
@@ -467,9 +472,18 @@ void refreshPage(int page) {
         lcd.print("Power: OFF          ");
       }
       
-      // Line 3: Connection status
+      // Line 3: PID parameters or limits
       lcd.setCursor(0, 3);
-      lcd.print((__FlashStringHelper*)status_connected);
+      lcd.print("P:");
+      formatNumber(tecPIDProportional, buf, 3);
+      lcd.print(buf);
+      lcd.print(" I:");
+      formatNumber(tecPIDIntegral, buf, 3);
+      lcd.print(buf);
+      lcd.print(" D:");
+      formatNumber(tecPIDDerivative, buf, 3);
+      lcd.print(buf);
+      lcd.print("   ");
       
     } else {
       // Level shifter enabled but no TEC response
@@ -537,19 +551,10 @@ void loop() {
   // Update the last pause state
   lastPauseState = currentlyPaused;
 
-  // Try to read TEC controller data (only if level shifter is enabled AND not during page changes)
-  // Skip TEC communication for responsive page switching
+  // Read TEC controller data (only if level shifter is enabled and not during page changes)
   if (levelShifterEnabled && !pageChanged && !pauseStateChanged) {
     readTECController();
   }
-
-  // Placeholder for future SoftwareSerial usage (D11 for TX, D10 for RX)
-  // Example usage:
-  // if (mySerial.available()) {
-  //   int inByte = mySerial.read();
-  //   // ...
-  // }
-  // mySerial.write(...);
 }
 
 int getPage() {
@@ -568,7 +573,7 @@ bool checkPauseState() {
   return !digitalRead(pinD5);  // LOW (GND) = paused, HIGH (5V) = normal
 }
 
-// Function to read TEC controller data
+// Function to read TEC controller data  
 void readTECController() {
   // Only proceed if level shifter is enabled
   if (!levelShifterEnabled) {
@@ -584,318 +589,217 @@ void readTECController() {
   }
   lastTecRead = now;
   
-  // Clear any pending data quickly without delay
+  // Clear any pending data
   while (mySerial.available()) {
     mySerial.read();
   }
   
-  // Try simple 'o' command first - most responsive approach
+  // Send 'o' command for single readout (per datasheet)
   mySerial.print("o\r\n");
   
-  // Wait for response with much shorter timeout for responsiveness
+  // Wait for response with timeout
   unsigned long startTime = millis();
   String response = "";
   
-  while (millis() - startTime < 200) { // Reduced from 2000ms to 200ms
+  while (millis() - startTime < 500) {
     if (mySerial.available()) {
       char c = mySerial.read();
-      
-      // More flexible response parsing - accept any printable characters
-      if (c >= 32 && c <= 126) { // Printable ASCII range
+      if (c >= 32 && c <= 126) { // Printable ASCII
         response += c;
       } else if ((c == '\r' || c == '\n') && response.length() > 0) {
-        break; // Got complete response
-      }
-      
-      // Also break if we get a reasonable amount of data
-      if (response.length() > 10) {
-        // Wait just a little more for any remaining data, but keep it short
-        unsigned long quickWait = millis();
-        while (mySerial.available() && response.length() < 100 && (millis() - quickWait < 20)) {
-          char extraChar = mySerial.read();
-          if (extraChar >= 32 && extraChar <= 126) {
-            response += extraChar;
-          } else if (extraChar == '\r' || extraChar == '\n') {
-            break;
-          }
-        }
-        break;
+        break; // Complete response received
       }
     }
-    // No delay here - check as fast as possible for responsiveness
   }
   
-  // Debug output - always show what we received
-  Serial.print(F("TEC Raw Response ("));
-  Serial.print(response.length());
-  Serial.print(F(" chars): '"));
-  Serial.print(response);
-  Serial.println(F("'"));
-  
-  // More flexible parsing - try different formats
+  // Parse TEC response according to datasheet format:
+  // <Tsetpoint P I D Tmin Tmax Tmeasured OC PWM>
   if (response.length() > 0) {
-    // Mark as connected if we get ANY response
     tecConnected = true;
-    tecFailCount = 0; // Reset fail counter on successful communication
-    
-    // Try to parse if it looks like the expected format
-    String cleanResponse = response;
-    cleanResponse.trim(); // Remove whitespace
+    tecFailCount = 0;
     
     // Remove angle brackets if present
+    String cleanResponse = response;
+    cleanResponse.trim();
     if (cleanResponse.startsWith("<") && cleanResponse.endsWith(">")) {
       cleanResponse = cleanResponse.substring(1, cleanResponse.length() - 1);
     }
     
-    // Try to parse space-separated values
-    int spaceCount = 0;
-    for (int i = 0; i < cleanResponse.length(); i++) {
-      if (cleanResponse.charAt(i) == ' ') spaceCount++;
-    }
+    // Parse 9 space-separated values
+    float values[9];
+    int valueCount = 0;
+    int startPos = 0;
     
-    if (spaceCount >= 8) { // Expected 9 values = 8 spaces
-      // Parse the full format
-      int startPos = 0;
-      float values[9];
-      bool parseSuccess = true;
+    for (int i = 0; i < 9 && valueCount < 9; i++) {
+      int spacePos = cleanResponse.indexOf(' ', startPos);
+      String valueStr;
       
-      for (int i = 0; i < 9; i++) {
-        int spacePos = cleanResponse.indexOf(' ', startPos);
-        String valueStr;
-        
-        if (spacePos == -1 && i == 8) { // Last value
-          valueStr = cleanResponse.substring(startPos);
-        } else if (spacePos != -1) {
-          valueStr = cleanResponse.substring(startPos, spacePos);
-          startPos = spacePos + 1;
-        } else {
-          parseSuccess = false;
-          break;
-        }
-        
-        values[i] = valueStr.toFloat();
-      }
-      
-      if (parseSuccess) {
-        // Assign parsed values according to protocol
-        tecSetTemp = values[0];      // Target temperature
-        tecActualTemp = values[6];   // Measured temperature  
-        tecOutputPower = values[8];  // PWM output power
-        tecPowerOn = (abs(tecOutputPower) > 0.1);
-        
-        Serial.print(F("TEC: Parsed successfully - Set:"));
-        Serial.print(tecSetTemp);
-        Serial.print(F(" Act:"));
-        Serial.print(tecActualTemp);
-        Serial.print(F(" Power:"));
-        Serial.println(tecOutputPower);
+      if (spacePos == -1) { // Last value
+        valueStr = cleanResponse.substring(startPos);
       } else {
-        Serial.println(F("TEC: Parse failed but got response"));
-        // Set some default values to show we're connected
-        tecSetTemp = 25.0;
-        tecActualTemp = 25.0;
-        tecOutputPower = 0.0;
-        tecPowerOn = false;
+        valueStr = cleanResponse.substring(startPos, spacePos);
+        startPos = spacePos + 1;
       }
-    } else {
-      // Simple response - just show we're connected
-      Serial.println(F("TEC: Got simple response"));
-      tecSetTemp = 25.0;
-      tecActualTemp = 25.0;
-      tecOutputPower = 0.0;
-      tecPowerOn = false;
+      
+      if (valueStr.length() > 0) {
+        values[valueCount++] = valueStr.toFloat();
+      }
     }
     
+    // Assign values according to datasheet protocol
+    if (valueCount >= 9) {
+      tecSetTemp = values[0];           // Tsetpoint
+      tecPIDProportional = values[1];   // P
+      tecPIDIntegral = values[2];       // I  
+      tecPIDDerivative = values[3];     // D
+      tecTempMin = values[4];           // Tmin
+      tecTempMax = values[5];           // Tmax
+      tecActualTemp = values[6];        // Tmeasured
+      tecOpenCollector = (values[7] > 0.5); // OC status
+      tecOutputPower = values[8];       // PWM percentage
+      tecPowerOn = (abs(tecOutputPower) > 0.1);
+      
+      Serial.print(F("TEC: Set="));
+      Serial.print(tecSetTemp, 1);
+      Serial.print(F("°C Act="));
+      Serial.print(tecActualTemp, 1);
+      Serial.print(F("°C PWM="));
+      Serial.print(tecOutputPower, 1);
+      Serial.println(F("%"));
+    } else {
+      Serial.println(F("TEC: Incomplete response"));
+    }
   } else {
-    // No response received
+    // No response - mark as disconnected
     tecConnected = false;
     tecFailCount++;
-    Serial.print(F("TEC: No response after trying multiple commands (fail #"));
-    Serial.print(tecFailCount);
-    Serial.println(F(")"));
     
-    // Run diagnostics every 10 failures
-    if (tecFailCount % 10 == 0) {
-      Serial.println(F("Running diagnostics due to repeated failures..."));
-      diagnoseTECConnection();
-    }
+         if (tecFailCount >= 5) {
+       Serial.print(F("TEC: No response ("));
+       Serial.print(tecFailCount);
+       Serial.println(F(" consecutive failures)"));
+       
+       // Run diagnostics every 10 failures
+       if (tecFailCount % 10 == 0) {
+         diagnoseTECConnection();
+       }
+     }
   }
 }
 
-// Function to set TEC temperature
-void setTECTemperature(float temperature) {
+// Function to configure TEC with full parameters (per datasheet)
+// Command format: <T setpoint P I D T min T max>
+void configureTEC(float setpoint, float p, float i, float d, float tmin, float tmax) {
   if (!levelShifterEnabled) {
     Serial.println(F("TEC: Cannot send command - level shifter disabled"));
     return;
   }
   
-  // Send configuration command: <T setpoint P I D T min T max>
-  // Using default PID values and temperature limits for now
-  String cmd = "<" + String(temperature, 1) + " 4.5 1.0 0.5 0.0 60.0>\r\n";
+  // Validate parameters according to datasheet
+  p = constrain(p, 0.0, 20.0);     // P coefficient range 0.0-20.0
+  i = constrain(i, 0.0, 20.0);     // I coefficient range 0.0-20.0  
+  d = constrain(d, 0.0, 20.0);     // D coefficient range 0.0-20.0
+  tmin = constrain(tmin, -100.0, 100.0); // Temperature range
+  tmax = constrain(tmax, -100.0, 100.0); // Temperature range
+  
+  // Format command string with proper precision
+  String cmd = "<" + String(setpoint, 1) + " " + 
+               String(p, 1) + " " + String(i, 1) + " " + String(d, 1) + " " +
+               String(tmin, 1) + " " + String(tmax, 1) + ">\r\n";
+  
   mySerial.print(cmd);
-  Serial.print(F("TEC Command sent: "));
+  Serial.print(F("TEC Config: "));
   Serial.println(cmd);
 }
 
-// Function to turn TEC power ON
+// Function to set TEC temperature using current PID parameters
+void setTECTemperature(float temperature) {
+  configureTEC(temperature, tecPIDProportional, tecPIDIntegral, 
+               tecPIDDerivative, tecTempMin, tecTempMax);
+}
+
+// Function to turn TEC power ON (per datasheet: 'A' command)
 void turnTECOn() {
   if (!levelShifterEnabled) {
     Serial.println(F("TEC: Cannot send command - level shifter disabled"));
     return;
   }
   
-  mySerial.print("A\r\n");  // 'A' - switch ON TEC supply
-  Serial.println(F("TEC: Power ON command sent"));
+  mySerial.print("A\r\n");
+  Serial.println(F("TEC: Power ON"));
 }
 
-// Function to turn TEC power OFF  
+// Function to turn TEC power OFF (per datasheet: 'a' command)  
 void turnTECOff() {
   if (!levelShifterEnabled) {
     Serial.println(F("TEC: Cannot send command - level shifter disabled"));
     return;
   }
   
-  mySerial.print("a\r\n");  // 'a' - switch OFF TEC supply
-  Serial.println(F("TEC: Power OFF command sent"));
+  mySerial.print("a\r\n");
+  Serial.println(F("TEC: Power OFF"));
 }
 
-// Function to try different baud rates for TEC communication
-void tryTECBaudRates() {
+// Function to start/stop cyclic readout mode
+void setTECCyclicMode(bool enable) {
   if (!levelShifterEnabled) {
+    Serial.println(F("TEC: Cannot send command - level shifter disabled"));
     return;
   }
   
-  // Use static array to prevent memory issues
-  static const long baudRates[] = {9600, 19200, 38400, 57600, 115200};
-  const int numRates = 5;
-  
-  Serial.println(F("Testing TEC baud rates..."));
-  
-  for (int i = 0; i < numRates; i++) {
-    Serial.print(F("Trying baud rate: "));
-    Serial.println(baudRates[i]);
-    
-    // Reinitialize serial at new baud rate
-    mySerial.end();
-    delay(100);
-    mySerial.begin(baudRates[i]);
-    delay(100);
-    
-    // Clear buffer
-    while (mySerial.available()) {
-      mySerial.read();
-    }
-    
-    // Try simple command
-    mySerial.print("o");
-    delay(200);
-    
-    // Check for any response
-    String response = "";
-    unsigned long startTime = millis();
-    while (millis() - startTime < 500) {
-      if (mySerial.available()) {
-        char c = mySerial.read();
-        if (c >= 32 && c <= 126) {
-          response += c;
-        }
-        if (response.length() > 5) break; // Got some data
-      }
-    }
-    
-    if (response.length() > 0) {
-      Serial.print(F("SUCCESS at "));
-      Serial.print(baudRates[i]);
-      Serial.print(F(" baud: "));
-      Serial.println(response);
-      return; // Keep this baud rate
-    }
+  if (enable) {
+    mySerial.print("R\r\n");  // Turn ON cyclic print
+    Serial.println(F("TEC: Cyclic mode ON"));
+  } else {
+    mySerial.print("r\r\n");  // Turn OFF cyclic print  
+    Serial.println(F("TEC: Cyclic mode OFF"));
   }
-  
-  // If no success, go back to default
-  Serial.println(F("No response at any baud rate, using 38400"));
-  mySerial.end();
-  delay(100);
-  mySerial.begin(38400);
 }
 
-// Function to diagnose serial communication issues
+
+
+// Function to diagnose TEC connection issues
 void diagnoseTECConnection() {
-  Serial.println(F("\n=== TEC CONNECTION DIAGNOSTICS ==="));
+  Serial.println(F("\n=== TEC DIAGNOSTICS ==="));
   
   // Check level shifter enable pin
-  Serial.print(F("Level Shifter OE Pin (D9): "));
-  Serial.println(digitalRead(oePin) ? "HIGH (enabled)" : "LOW (disabled)");
+  Serial.print(F("Level Shifter OE (D9): "));
+  Serial.println(digitalRead(oePin) ? "ENABLED" : "DISABLED");
   
-  // Check 3.3V supply
+  // Check 3.3V supply voltage
   int analogValue = analogRead(voltageCheckPin);
   float voltage = (analogValue * 5.0) / 1023.0;
   Serial.print(F("3.3V Supply (A1): "));
   Serial.print(voltage, 2);
-  Serial.println(F("V"));
-  
-  // Test with level shifter DISABLED first
-  Serial.println(F("\n--- Testing with Level Shifter DISABLED ---"));
-  digitalWrite(oePin, LOW); // Disable level shifter
-  delay(100);
-  
-  pinMode(TEC_RX_PIN, INPUT_PULLUP);
-  pinMode(TEC_TX_PIN, OUTPUT);
-  digitalWrite(TEC_TX_PIN, HIGH);
-  delay(100);
-  
-  Serial.print(F("D")); Serial.print(TEC_RX_PIN); Serial.print(F(" (RX) with OE=LOW, pullup: "));
-  Serial.println(digitalRead(TEC_RX_PIN) ? "HIGH" : "LOW");
-  
-  Serial.print(F("D")); Serial.print(TEC_TX_PIN); Serial.print(F(" (TX) with OE=LOW: "));
-  Serial.println(digitalRead(TEC_TX_PIN) ? "HIGH" : "LOW");
-  
-  // Test with level shifter ENABLED
-  Serial.println(F("\n--- Testing with Level Shifter ENABLED ---"));
-  digitalWrite(oePin, HIGH); // Enable level shifter
-  delay(100);
-  
-  Serial.print(F("D")); Serial.print(TEC_RX_PIN); Serial.print(F(" (RX) with OE=HIGH, pullup: "));
-  Serial.println(digitalRead(TEC_RX_PIN) ? "HIGH" : "LOW");
-  
-  Serial.print(F("D")); Serial.print(TEC_TX_PIN); Serial.print(F(" (TX) with OE=HIGH: "));
-  Serial.println(digitalRead(TEC_TX_PIN) ? "HIGH" : "LOW");
-  
-  // Test bidirectional communication through level shifter
-  Serial.println(F("\n--- Level Shifter Bidirectional Test ---"));
-  
-  // Make RX pin an output temporarily to test level shifter
-  pinMode(TEC_RX_PIN, OUTPUT);
-  
-  Serial.print(F("Setting D")); Serial.print(TEC_RX_PIN); Serial.print(F("=LOW: reads = "));
-  digitalWrite(TEC_RX_PIN, LOW);
-  delay(50);
-  pinMode(TEC_RX_PIN, INPUT);
-  Serial.println(digitalRead(TEC_RX_PIN) ? "HIGH" : "LOW");
-  
-  Serial.print(F("Setting D")); Serial.print(TEC_RX_PIN); Serial.print(F("=HIGH: reads = "));
-  pinMode(TEC_RX_PIN, OUTPUT);
-  digitalWrite(TEC_RX_PIN, HIGH);
-  delay(50);
-  pinMode(TEC_RX_PIN, INPUT);
-  Serial.println(digitalRead(TEC_RX_PIN) ? "HIGH" : "LOW");
-  
-  // Test if something external is pulling RX pin low
-  Serial.println(F("\n--- External Pull Test ---"));
-  pinMode(TEC_RX_PIN, INPUT_PULLUP);
-  delay(100);
-  Serial.print(F("D")); Serial.print(TEC_RX_PIN); Serial.print(F(" with strong internal pullup: "));
-  Serial.println(digitalRead(TEC_RX_PIN) ? "HIGH" : "LOW");
-  
-  if (digitalRead(TEC_RX_PIN) == LOW) {
-    Serial.print(F("*** WARNING: D")); Serial.print(TEC_RX_PIN); Serial.println(F(" stuck LOW - possible short to ground! ***"));
-    Serial.println(F("*** Check wiring and TXS0108E connections ***"));
+  Serial.print(F("V - "));
+  if (voltage >= 2.97 && voltage <= 3.63) {
+    Serial.println(F("OK"));
+  } else {
+    Serial.println(F("OUT OF RANGE"));
   }
+  
+  // Check TEC communication pins
+  Serial.print(F("TEC RX Pin (D")); Serial.print(TEC_RX_PIN); Serial.print(F("): "));
+  pinMode(TEC_RX_PIN, INPUT_PULLUP);
+  delay(10);
+  Serial.println(digitalRead(TEC_RX_PIN) ? "HIGH" : "LOW");
+  
+  Serial.print(F("TEC TX Pin (D")); Serial.print(TEC_TX_PIN); Serial.print(F("): "));
+  Serial.println(digitalRead(TEC_TX_PIN) ? "HIGH" : "LOW");
+  
+  // Check TEC connection status
+  Serial.print(F("TEC Connected: "));
+  Serial.println(tecConnected ? "YES" : "NO");
+  
+  Serial.print(F("Consecutive Failures: "));
+  Serial.println(tecFailCount);
   
   // Restore normal operation
   if (levelShifterEnabled) {
     digitalWrite(oePin, HIGH);
-    mySerial.begin(38400);
+    if (!mySerial) {
+      mySerial.begin(38400);
+    }
   } else {
     digitalWrite(oePin, LOW);
   }
