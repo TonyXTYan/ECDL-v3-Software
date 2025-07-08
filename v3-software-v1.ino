@@ -82,8 +82,9 @@ bool tecOpenCollector = false;
 bool levelShifterEnabled = false;
 float supply3V3 = 0.0;
 unsigned long lastTecRead = 0;
-const unsigned long tecReadInterval = 2000; // Read every 2 seconds
+const unsigned long tecReadInterval = 3000; // Read every 3 seconds (give TEC more time)
 int tecFailCount = 0; // Counter for failed TEC communications
+String rawTecResponse = ""; // Store raw TEC response for display
 
 // Thermistor calculation constants
 const float beta = 3375.0;        // For laser diode thermistor
@@ -145,28 +146,18 @@ void formatNumber(float value, char* buffer, int width = 6) {
     decimalPlaces = max(0, availableWidth - intDigits - 1); // -1 for decimal point
   }
 
-  // Format the number
+  // Format the number with exact width and decimal places
   dtostrf(value, availableWidth, decimalPlaces, buffer);
-  
-  // Remove leading spaces and ensure proper formatting
-  char temp[16];
-  strcpy(temp, buffer);
-  
-  // Find first non-space character
-  int start = 0;
-  while (temp[start] == ' ' && start < strlen(temp)) start++;
-  
-  // Copy without leading spaces
-  strcpy(buffer, &temp[start]);
   
   // Add negative sign if needed
   if (isNegative) {
+    // Shift everything right and add negative sign
     int len = strlen(buffer);
     memmove(buffer + 1, buffer, len + 1);
     buffer[0] = '-';
   }
   
-  // Ensure we don't exceed width
+  // Ensure we don't exceed width and null terminate
   buffer[width] = '\0';
 }
 
@@ -185,7 +176,7 @@ void setup() {
   digitalWrite(ledPin, LOW);
 
   // Start serial
-  Serial.begin(9600);
+  Serial.begin(38400);
   // Don't start mySerial yet - wait for 3.3V detection
 
   // LCD init
@@ -408,23 +399,16 @@ void refreshPage(int page) {
       }
     }
   } else if (page == 3) {
-    // TEC Controller Page - Compact 20x4 layout
-    char buf[12];  // Increased buffer size for safety
-    
-    // Line 0: Header with voltage and OE status (must fit 20 chars)
-    lcd.setCursor(0, 0);
-    lcd.print("TEC:3.3V=");
-    if (levelShifterEnabled) {
-      lcd.print("OK");
-    } else {
-      formatNumber(supply3V3, buf, 4);
-      lcd.print(buf);
-    }
-    lcd.print(" OE=");
-    lcd.print(levelShifterEnabled ? "1" : "0");
-    lcd.print("  ");  // Fill remaining space
+    // TEC Controller Page - Display raw response
     
     if (!levelShifterEnabled) {
+      // Line 0: Show voltage status
+      lcd.setCursor(0, 0);
+      lcd.print("TEC:3.3V=");
+      char buf[4];
+      formatNumber(supply3V3, buf, 3);
+      lcd.print(buf);
+      lcd.print("V       ");  // Clear rest
       // Level shifter disabled
       lcd.setCursor(0, 1);
       if (supply3V3 < 2.97) {
@@ -441,60 +425,76 @@ void refreshPage(int page) {
       lcd.setCursor(0, 3);
       lcd.print((__FlashStringHelper*)status_need_voltage);
       
-    } else if (tecConnected) {
-      // TEC connected - show detailed info
+    } else if (tecConnected && rawTecResponse.length() > 0) {
+      // TEC connected - show parsed response in compact format
+      String response = rawTecResponse;
+      response.trim();
       
-      // Line 1: Temperatures with open collector status
+      // Extract key values for compact display
+      float tz = tecSetTemp;
+      float tr = tecActualTemp; 
+      float pw = tecOutputPower;
+      int oc = tecOpenCollector ? 1 : 0;
+      
+      // Line 0: Temperatures (Tz and Tr)
+      lcd.setCursor(0, 0);
+      char tzBuf[6], trBuf[6];
+      formatNumber(tz, tzBuf, 5);
+      formatNumber(tr, trBuf, 5);
+      lcd.print("Tz=");
+      lcd.print(tzBuf);
+      lcd.print(" Tr=");
+      lcd.print(trBuf);
+      lcd.print("    "); // Clear rest of line
+      
+      // Line 1: PID P and I (with 2 decimal places)
       lcd.setCursor(0, 1);
-      lcd.print("Act:");
-      formatNumber(tecActualTemp, buf, 4);
-      lcd.print(buf);
-      lcd.print(" Set:");
-      formatNumber(tecSetTemp, buf, 4);
-      lcd.print(buf);
-      lcd.print(tecOpenCollector ? "!C" : "C");  // '!' if OC active
+      char pBuf[6], iBuf[6];
+      formatNumber(tecPIDProportional, pBuf, 5);
+      formatNumber(tecPIDIntegral, iBuf, 5);
+      lcd.print("P =");
+      lcd.print(pBuf);
+      lcd.print(" I =");
+      lcd.print(iBuf);
+      lcd.print("   "); // Clear rest of line
       
-      // Line 2: Power output with direction
+      // Line 2: PID D only
       lcd.setCursor(0, 2);
-      if (tecPowerOn) {
-        if (tecOutputPower > 0) {
-          lcd.print("Heat:");
-          formatNumber(tecOutputPower, buf, 5);
-          lcd.print(buf); lcd.print("%        ");
-        } else if (tecOutputPower < 0) {
-          lcd.print("Cool:");
-          formatNumber(-tecOutputPower, buf, 5);
-          lcd.print(buf); lcd.print("%        ");
-        } else {
-          lcd.print("Idle: 0.0%          ");
-        }
-      } else {
-        lcd.print("Power: OFF          ");
-      }
+      char dBuf[6];
+      formatNumber(tecPIDDerivative, dBuf, 5);
+      lcd.print("D =");
+      lcd.print(dBuf);
+      lcd.print("          "); // Clear rest of line
       
-      // Line 3: PID parameters or limits
+      // Line 3: Power and Open Collector
       lcd.setCursor(0, 3);
-      lcd.print("P:");
-      formatNumber(tecPIDProportional, buf, 3);
-      lcd.print(buf);
-      lcd.print(" I:");
-      formatNumber(tecPIDIntegral, buf, 3);
-      lcd.print(buf);
-      lcd.print(" D:");
-      formatNumber(tecPIDDerivative, buf, 3);
-      lcd.print(buf);
-      lcd.print("   ");
+      char pwBuf[5];
+      formatNumber(pw, pwBuf, 4);
+      lcd.print("PW=");
+      lcd.print(pwBuf);
+      lcd.print("  OC=");
+      lcd.print(oc);
+      lcd.print("      "); // Clear rest of line
       
     } else {
       // Level shifter enabled but no TEC response
+      lcd.setCursor(0, 0);
+      lcd.print("No TEC Response     ");
+      
       lcd.setCursor(0, 1);
-      lcd.print((__FlashStringHelper*)status_no_response);
+      lcd.print("Check: Cable/Power  ");
       
       lcd.setCursor(0, 2);
-      lcd.print((__FlashStringHelper*)status_check_cable);
+      lcd.print("3.3V=OK OE=1        ");
       
       lcd.setCursor(0, 3);
-      lcd.print((__FlashStringHelper*)status_ready);
+      if (tecFailCount > 0) {
+        lcd.print("Fails:");
+        lcd.print(tecFailCount);
+        lcd.print("            ");
+      } else {
+        lcd.print("Waiting...          ");
+      }
     }
   } else if (page == 0) {
     // Page 0: System status/info
@@ -597,11 +597,11 @@ void readTECController() {
   // Send 'o' command for single readout (per datasheet)
   mySerial.print("o\r\n");
   
-  // Wait for response with timeout
+  // Wait for response with longer timeout
   unsigned long startTime = millis();
   String response = "";
   
-  while (millis() - startTime < 500) {
+  while (millis() - startTime < 1000) {
     if (mySerial.available()) {
       char c = mySerial.read();
       if (c >= 32 && c <= 126) { // Printable ASCII
@@ -612,149 +612,174 @@ void readTECController() {
     }
   }
   
-  // Parse TEC response according to datasheet format:
-  // <Tsetpoint P I D Tmin Tmax Tmeasured OC PWM>
+  // Parse TEC response - handle both Basic and Advanced formats
   if (response.length() > 0) {
     tecConnected = true;
     tecFailCount = 0;
+    rawTecResponse = response; // Store raw response
     
-    // Remove angle brackets if present
+    // Show raw TEC response in serial monitor
+    Serial.print(F("TEC RAW: '"));
+    Serial.print(response);
+    Serial.println(F("'"));
+    
     String cleanResponse = response;
     cleanResponse.trim();
+    
+    // Check if this is Advanced format (angle brackets)
     if (cleanResponse.startsWith("<") && cleanResponse.endsWith(">")) {
+      // Advanced format: <Tsetpoint P I D Tmin Tmax Tmeasured OC PWM>
       cleanResponse = cleanResponse.substring(1, cleanResponse.length() - 1);
-    }
-    
-    // Parse 9 space-separated values
-    float values[9];
-    int valueCount = 0;
-    int startPos = 0;
-    
-    for (int i = 0; i < 9 && valueCount < 9; i++) {
-      int spacePos = cleanResponse.indexOf(' ', startPos);
-      String valueStr;
       
-      if (spacePos == -1) { // Last value
-        valueStr = cleanResponse.substring(startPos);
-      } else {
-        valueStr = cleanResponse.substring(startPos, spacePos);
+      float values[9];
+      int valueCount = 0;
+      int startPos = 0;
+      
+      for (int i = 0; i < 9 && valueCount < 9; i++) {
+        int spacePos = cleanResponse.indexOf(' ', startPos);
+        String valueStr = (spacePos == -1) ? cleanResponse.substring(startPos) : 
+                         cleanResponse.substring(startPos, spacePos);
+        
+        if (valueStr.length() > 0) {
+          values[valueCount++] = valueStr.toFloat();
+        }
+        if (spacePos == -1) break;
         startPos = spacePos + 1;
       }
       
-      if (valueStr.length() > 0) {
-        values[valueCount++] = valueStr.toFloat();
+      if (valueCount >= 9) {
+        tecSetTemp = values[0];
+        tecPIDProportional = values[1];
+        tecPIDIntegral = values[2];
+        tecPIDDerivative = values[3];
+        tecTempMin = values[4];
+        tecTempMax = values[5];
+        tecActualTemp = values[6];
+        tecOpenCollector = (values[7] > 0.5);
+        tecOutputPower = values[8];
+        tecPowerOn = (abs(tecOutputPower) > 0.1);
+        
+        Serial.println(F("TEC: Advanced format OK"));
+      } else {
+        Serial.print(F("TEC: Advanced incomplete, got "));
+        Serial.print(valueCount);
+        Serial.println(F(" values"));
+      }
+    } 
+    else {
+      // Basic format: Tz=25.01 P=5.09 I=2.02 D=1.01 Tr=25.72 OC=0 PW=100
+      bool parsed = false;
+      
+      // Look for key=value pairs
+      if (cleanResponse.indexOf("Tz=") != -1) {
+        int pos;
+        
+        // Parse temperature setpoint (Tz)
+        pos = cleanResponse.indexOf("Tz=");
+        if (pos != -1) {
+          pos += 3; // Skip "Tz="
+          int end = cleanResponse.indexOf(' ', pos);
+          if (end == -1) end = cleanResponse.length();
+          tecSetTemp = cleanResponse.substring(pos, end).toFloat();
+        }
+        
+        // Parse actual temperature (Tr)  
+        pos = cleanResponse.indexOf("Tr=");
+        if (pos != -1) {
+          pos += 3; // Skip "Tr="
+          int end = cleanResponse.indexOf(' ', pos);
+          if (end == -1) end = cleanResponse.length();
+          tecActualTemp = cleanResponse.substring(pos, end).toFloat();
+        }
+        
+        // Parse PID parameters
+        pos = cleanResponse.indexOf("P=");
+        if (pos != -1) {
+          pos += 2; // Skip "P="
+          int end = cleanResponse.indexOf(' ', pos);
+          if (end == -1) end = cleanResponse.length();
+          tecPIDProportional = cleanResponse.substring(pos, end).toFloat();
+        }
+        
+        pos = cleanResponse.indexOf("I=");
+        if (pos != -1) {
+          pos += 2; // Skip "I="
+          int end = cleanResponse.indexOf(' ', pos);
+          if (end == -1) end = cleanResponse.length();
+          tecPIDIntegral = cleanResponse.substring(pos, end).toFloat();
+        }
+        
+        pos = cleanResponse.indexOf("D=");
+        if (pos != -1) {
+          pos += 2; // Skip "D="
+          int end = cleanResponse.indexOf(' ', pos);
+          if (end == -1) end = cleanResponse.length();
+          tecPIDDerivative = cleanResponse.substring(pos, end).toFloat();
+        }
+        
+        // Parse PWM output (PW)
+        pos = cleanResponse.indexOf("PW=");
+        if (pos != -1) {
+          pos += 3; // Skip "PW="
+          int end = cleanResponse.indexOf(' ', pos);
+          if (end == -1) end = cleanResponse.length();
+          tecOutputPower = cleanResponse.substring(pos, end).toFloat();
+        }
+        
+        // Parse open collector (OC)
+        pos = cleanResponse.indexOf("OC=");
+        if (pos != -1) {
+          pos += 3; // Skip "OC="
+          int end = cleanResponse.indexOf(' ', pos);
+          if (end == -1) end = cleanResponse.length();
+          tecOpenCollector = (cleanResponse.substring(pos, end).toFloat() > 0.5);
+        }
+        
+        tecPowerOn = (abs(tecOutputPower) > 0.1);
+        parsed = true;
+        Serial.println(F("TEC: Basic format OK"));
+      }
+      
+      if (!parsed) {
+        Serial.print(F("TEC: Unknown format: '"));
+        Serial.print(cleanResponse);
+        Serial.println(F("'"));
       }
     }
     
-    // Assign values according to datasheet protocol
-    if (valueCount >= 9) {
-      tecSetTemp = values[0];           // Tsetpoint
-      tecPIDProportional = values[1];   // P
-      tecPIDIntegral = values[2];       // I  
-      tecPIDDerivative = values[3];     // D
-      tecTempMin = values[4];           // Tmin
-      tecTempMax = values[5];           // Tmax
-      tecActualTemp = values[6];        // Tmeasured
-      tecOpenCollector = (values[7] > 0.5); // OC status
-      tecOutputPower = values[8];       // PWM percentage
-      tecPowerOn = (abs(tecOutputPower) > 0.1);
-      
-      Serial.print(F("TEC: Set="));
+    // Show parsed values (only occasionally to avoid spam)
+    if (tecFailCount > 0) {
+      Serial.print(F("TEC: CONNECTED! Set="));
       Serial.print(tecSetTemp, 1);
       Serial.print(F("°C Act="));
       Serial.print(tecActualTemp, 1);
       Serial.print(F("°C PWM="));
       Serial.print(tecOutputPower, 1);
       Serial.println(F("%"));
-    } else {
-      Serial.println(F("TEC: Incomplete response"));
     }
+    
   } else {
     // No response - mark as disconnected
     tecConnected = false;
     tecFailCount++;
+    rawTecResponse = ""; // Clear stale response
     
-         if (tecFailCount >= 5) {
+         if (tecFailCount == 5) {
        Serial.print(F("TEC: No response ("));
        Serial.print(tecFailCount);
        Serial.println(F(" consecutive failures)"));
-       
-       // Run diagnostics every 10 failures
-       if (tecFailCount % 10 == 0) {
-         diagnoseTECConnection();
-       }
+     } else if (tecFailCount % 20 == 0) {
+       // Run diagnostics every 20 failures (less frequent)
+       Serial.print(F("TEC: Still no response ("));
+       Serial.print(tecFailCount);
+       Serial.println(F(" failures)"));
+       diagnoseTECConnection();
      }
   }
 }
 
-// Function to configure TEC with full parameters (per datasheet)
-// Command format: <T setpoint P I D T min T max>
-void configureTEC(float setpoint, float p, float i, float d, float tmin, float tmax) {
-  if (!levelShifterEnabled) {
-    Serial.println(F("TEC: Cannot send command - level shifter disabled"));
-    return;
-  }
-  
-  // Validate parameters according to datasheet
-  p = constrain(p, 0.0, 20.0);     // P coefficient range 0.0-20.0
-  i = constrain(i, 0.0, 20.0);     // I coefficient range 0.0-20.0  
-  d = constrain(d, 0.0, 20.0);     // D coefficient range 0.0-20.0
-  tmin = constrain(tmin, -100.0, 100.0); // Temperature range
-  tmax = constrain(tmax, -100.0, 100.0); // Temperature range
-  
-  // Format command string with proper precision
-  String cmd = "<" + String(setpoint, 1) + " " + 
-               String(p, 1) + " " + String(i, 1) + " " + String(d, 1) + " " +
-               String(tmin, 1) + " " + String(tmax, 1) + ">\r\n";
-  
-  mySerial.print(cmd);
-  Serial.print(F("TEC Config: "));
-  Serial.println(cmd);
-}
-
-// Function to set TEC temperature using current PID parameters
-void setTECTemperature(float temperature) {
-  configureTEC(temperature, tecPIDProportional, tecPIDIntegral, 
-               tecPIDDerivative, tecTempMin, tecTempMax);
-}
-
-// Function to turn TEC power ON (per datasheet: 'A' command)
-void turnTECOn() {
-  if (!levelShifterEnabled) {
-    Serial.println(F("TEC: Cannot send command - level shifter disabled"));
-    return;
-  }
-  
-  mySerial.print("A\r\n");
-  Serial.println(F("TEC: Power ON"));
-}
-
-// Function to turn TEC power OFF (per datasheet: 'a' command)  
-void turnTECOff() {
-  if (!levelShifterEnabled) {
-    Serial.println(F("TEC: Cannot send command - level shifter disabled"));
-    return;
-  }
-  
-  mySerial.print("a\r\n");
-  Serial.println(F("TEC: Power OFF"));
-}
-
-// Function to start/stop cyclic readout mode
-void setTECCyclicMode(bool enable) {
-  if (!levelShifterEnabled) {
-    Serial.println(F("TEC: Cannot send command - level shifter disabled"));
-    return;
-  }
-  
-  if (enable) {
-    mySerial.print("R\r\n");  // Turn ON cyclic print
-    Serial.println(F("TEC: Cyclic mode ON"));
-  } else {
-    mySerial.print("r\r\n");  // Turn OFF cyclic print  
-    Serial.println(F("TEC: Cyclic mode OFF"));
-  }
-}
+// Note: TEC control functions removed - using hardware trimmers for control
+// This code only monitors TEC status via UART (read-only)
 
 
 
