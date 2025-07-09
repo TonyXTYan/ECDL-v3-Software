@@ -111,13 +111,27 @@ uint8_t ads1_hist_count[4] = {0};
 
 // Custom channel names for ADS0 and ADS1 (now in PROGMEM above)
 
+// Function to format PID values with decimal point alignment (xx.xx format)
+void formatPID(float value, char* buffer) {
+  // Format as xx.xx with leading zero if needed
+  if (value >= 0 && value < 10) {
+    dtostrf(value, 5, 2, buffer); // 5 total width, 2 decimal places: " x.xx"
+    // Replace leading space with zero for alignment
+    if (buffer[0] == ' ') buffer[0] = '0';
+  } else {
+    dtostrf(value, 5, 2, buffer); // xx.xx format
+  }
+  // Ensure null termination
+  buffer[5] = '\0';
+}
+
 // Function to format number for compact display (width 2-8 characters including decimal)
 void formatNumber(float value, char* buffer, int width = 6) {
   // Clamp width to valid range
   width = constrain(width, 2, 8);
   
-  // Handle zero
-  if (value == 0.0f) {
+  // Handle zero and very small values near zero
+  if (abs(value) < 0.0001f) {
     strcpy(buffer, "0.");
     for (int i = 2; i < width; i++) buffer[i] = '0';
     buffer[width] = '\0';
@@ -138,9 +152,19 @@ void formatNumber(float value, char* buffer, int width = 6) {
   if (value >= pow(10, availableWidth - 1)) {
     decimalPlaces = 0;  // xxxxx. format for very large values
   } else {
-    // Count integer digits needed
-    int intDigits = (value >= 1.0) ? (int)log10(value) + 1 : 1;
-    decimalPlaces = max(0, availableWidth - intDigits - 1); // -1 for decimal point
+    // Count integer digits needed - improved logic
+    int intDigits;
+    if (value >= 1.0) {
+      intDigits = (int)log10(value) + 1;
+    } else {
+      intDigits = 1; // For values < 1.0, we need at least "0."
+    }
+    
+    // Ensure we have at least 1 decimal place for small numbers
+    decimalPlaces = max(1, availableWidth - intDigits - 1); // -1 for decimal point
+    
+    // Cap decimal places to reasonable limit
+    decimalPlaces = min(decimalPlaces, 3);
   }
 
   // Format the number with exact width and decimal places
@@ -359,11 +383,7 @@ void refreshPage(int page) {
         
         // Apply IMON formula for channel 0: IMON = (V/20)*1000 (in mA)
         if (ch == 0) {
-          if (value > 0.0) {
             value = (value / 20) * 1000;
-          } else {
-            value = -999.0; // Error value for invalid readings
-          }
         }
         
         // Update circular buffer
@@ -437,7 +457,7 @@ void refreshPage(int page) {
       lcd.setCursor(0, 0);
       char tzBuf[6], pBuf[6];
       formatNumber(tz, tzBuf, 5);
-      formatNumber(tecPIDProportional, pBuf, 5);
+      formatPID(tecPIDProportional, pBuf);
       lcd.print(" Tz=");
       lcd.print(tzBuf);
       lcd.print("  P =");
@@ -448,7 +468,7 @@ void refreshPage(int page) {
       lcd.setCursor(0, 1);
       char trBuf[6], iBuf[6];
       formatNumber(tr, trBuf, 5);
-      formatNumber(tecPIDIntegral, iBuf, 5);
+      formatPID(tecPIDIntegral, iBuf);
       lcd.print(" Tr=");
       lcd.print(trBuf);
       lcd.print("  I =");
@@ -458,7 +478,7 @@ void refreshPage(int page) {
       // Line 2: PID D only
       lcd.setCursor(0, 2);
       char dBuf[6];
-      formatNumber(tecPIDDerivative, dBuf, 5);
+      formatPID(tecPIDDerivative, dBuf);
       lcd.print("           D =");
       lcd.print(dBuf);
       lcd.print(" "); // Clear rest of line
@@ -615,10 +635,41 @@ void readTECController() {
     tecFailCount = 0;
     rawTecResponse = response; // Store raw response
     
+    // Output raw TEC response to computer serial
+    Serial.print(F("TEC_RAW: "));
+    Serial.println(response);
+    
     // Store raw response for display (debug output reduced)
     
     String cleanResponse = response;
     cleanResponse.trim();
+    
+    // Validate response completeness before parsing
+    // Check that all required parameters are present with values
+    bool isComplete = true;
+    if (cleanResponse.indexOf("Tz=") == -1) isComplete = false;
+    if (cleanResponse.indexOf("P=") == -1) isComplete = false;
+    if (cleanResponse.indexOf("I=") == -1) isComplete = false;
+    if (cleanResponse.indexOf("D=") == -1) isComplete = false;
+    if (cleanResponse.indexOf("Tr=") == -1) isComplete = false;
+    if (cleanResponse.indexOf("OC=") == -1) isComplete = false;
+    if (cleanResponse.indexOf("PW=") == -1) isComplete = false;
+    
+    // Check that PW has a value (not just "PW=" at the end)
+    int pwPos = cleanResponse.indexOf("PW=");
+    if (pwPos != -1) {
+      int nextParamPos = cleanResponse.indexOf(" OC=", pwPos);
+      if (nextParamPos == -1) nextParamPos = cleanResponse.length();
+      String pwCheck = cleanResponse.substring(pwPos + 3, nextParamPos);
+      pwCheck.trim();
+      pwCheck.replace(" ", "");
+      if (pwCheck.length() == 0) isComplete = false; // PW= with no value
+    }
+    
+    if (!isComplete) {
+      Serial.println(F("TEC_INCOMPLETE: Ignoring incomplete response"));
+      return; // Skip parsing and keep previous values
+    }
     
     // Parse Basic format: Tz=25.01 P=5.09 I=2.02 D=1.01 Tr=25.72 OC=0 PW=100
     if (cleanResponse.indexOf("Tz=") != -1) {
@@ -642,10 +693,12 @@ void readTECController() {
           tecActualTemp = cleanResponse.substring(pos, end).toFloat();
         }
         
-        // Parse PID parameters
+                // Parse PID parameters - handle spaces and signs in TEC format
         pos = cleanResponse.indexOf("P=");
         if (pos != -1) {
           pos += 2; // Skip "P="
+          // Skip any spaces after the equals
+          while (pos < cleanResponse.length() && cleanResponse[pos] == ' ') pos++;
           int end = cleanResponse.indexOf(' ', pos);
           if (end == -1) end = cleanResponse.length();
           tecPIDProportional = cleanResponse.substring(pos, end).toFloat();
@@ -654,6 +707,8 @@ void readTECController() {
         pos = cleanResponse.indexOf("I=");
         if (pos != -1) {
           pos += 2; // Skip "I="
+          // Skip any spaces after the equals
+          while (pos < cleanResponse.length() && cleanResponse[pos] == ' ') pos++;
           int end = cleanResponse.indexOf(' ', pos);
           if (end == -1) end = cleanResponse.length();
           tecPIDIntegral = cleanResponse.substring(pos, end).toFloat();
@@ -662,19 +717,45 @@ void readTECController() {
         pos = cleanResponse.indexOf("D=");
         if (pos != -1) {
           pos += 2; // Skip "D="
+          // Skip any spaces after the equals
+          while (pos < cleanResponse.length() && cleanResponse[pos] == ' ') pos++;
           int end = cleanResponse.indexOf(' ', pos);
           if (end == -1) end = cleanResponse.length();
           tecPIDDerivative = cleanResponse.substring(pos, end).toFloat();
         }
-        
-        // Parse PWM output (PW)
+          
+        // Parse PWM output (PW) - handle spaces, + and - signs with spaces
         pos = cleanResponse.indexOf("PW=");
         if (pos != -1) {
           pos += 3; // Skip "PW="
-          int end = cleanResponse.indexOf(' ', pos);
-          if (end == -1) end = cleanResponse.length();
-          tecOutputPower = cleanResponse.substring(pos, end).toFloat();
+          
+          // Find the end of the PW value (next parameter or end of string)
+          int nextParam = cleanResponse.indexOf(" OC=", pos);
+          if (nextParam == -1) nextParam = cleanResponse.length();
+          
+          // Extract the PW value substring
+          String pwValue = cleanResponse.substring(pos, nextParam);
+          pwValue.trim(); // Remove leading/trailing spaces
+          
+          // Handle the case where there are spaces in the value (e.g., "- 47")
+          pwValue.replace(" ", ""); // Remove all internal spaces
+          
+          if (pwValue.length() > 0) {
+            tecOutputPower = pwValue.toFloat();
+          } else {
+            tecOutputPower = 0; // Empty value
+          }
         }
+          
+        // Debug output for parsed PID values
+        Serial.print(F("TEC_PARSED: P="));
+        Serial.print(tecPIDProportional, 2);
+        Serial.print(F(" I="));
+        Serial.print(tecPIDIntegral, 2);
+        Serial.print(F(" D="));
+        Serial.print(tecPIDDerivative, 2);
+        Serial.print(F(" PW="));
+        Serial.println(tecOutputPower, 0);
         
         // Parse open collector (OC)
         pos = cleanResponse.indexOf("OC=");
