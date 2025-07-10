@@ -83,6 +83,14 @@ const unsigned long tecReadInterval = 3000; // Read every 3 seconds (give TEC mo
 int tecFailCount = 0; // Counter for failed TEC communications
 String rawTecResponse = ""; // Store raw TEC response for display
 
+// Global variables for ADC readings (updated by printKeyChannels)
+float ads0_values[4] = {0.0, 0.0, 0.0, 0.0}; // VTEC, ITEC, TSET, TACT
+float ads1_values[4] = {0.0, 0.0, 0.0, 0.0}; // IMON, A1C1, A1C2, A1C3
+int16_t ads0_raw[4] = {0, 0, 0, 0};
+int16_t ads1_raw[4] = {0, 0, 0, 0};
+float ads0_volts[4] = {0.0, 0.0, 0.0, 0.0};
+float ads1_volts[4] = {0.0, 0.0, 0.0, 0.0};
+
 // Thermistor calculation constants
 const float beta = 3375.0;        // For laser diode thermistor
 // Note: TEC controller uses 10k NTC thermistor with beta=3950 (per datasheet)
@@ -233,8 +241,8 @@ void setup() {
   }
 
   // Optional: Set gain (both chips)
-  ads0.setGain(GAIN_TWOTHIRDS);
-  ads1.setGain(GAIN_TWOTHIRDS);
+  ads0.setGain(GAIN_ONE);
+  ads1.setGain(GAIN_ONE);
   //                                                                ADS1115
   // ads.setGain(GAIN_TWOTHIRDS);  // 2/3x gain +/- 6.144V  1 bit = 0.1875mV
   // ads.setGain(GAIN_ONE);        // 1x gain   +/- 4.096V  1 bit = 0.125mV
@@ -315,33 +323,9 @@ void refreshPage(int page) {
         }
       }
     } else {
-      // Normal mode: read ADC and update display
+      // Normal mode: use global ADC values and update display
       for (int ch = 0; ch < 4; ch++) {
-        float value = ads0.computeVolts(ads0.readADC_SingleEnded(ch));
-        
-        // Apply VTEC formula for channel 0: VTEC = 2*(V-2.5) * 1000 (convert to mV)
-        if (ch == 0) {
-          value = 2.0 * (value - 2.5) * 1000.0;
-        }
-        // Apply ITEC formula for channel 1: ITEC = 2*(V-2.5) * 1000 (convert to mA)
-        if (ch == 1) {
-          value = 2.0 * (value - 2.5) * 1000.0;
-        }
-        // Apply temperature formula for channels 2 and 3: TSET and TACT
-        // T = (1/beta * ln((4.096-(V-1.65))/(4.096+(V-1.65))) + 1/(25+273.15))^-1
-        if (ch == 2 || ch == 3) {
-          float v_offset = value - 1.65;
-          float numerator = 4.096 - v_offset;
-          float denominator = 4.096 + v_offset;
-          
-          // Check for valid range to avoid log of negative numbers
-          if (numerator > 0 && denominator > 0) {
-            float temp_kelvin = 1.0 / ((1.0/beta) * log(numerator/denominator) + 1.0/(25.0+273.15));
-            value = temp_kelvin - 273.15; // Convert to Celsius
-          } else {
-            value = -999.0; // Error value for invalid readings
-          }
-        }
+        float value = ads0_values[ch]; // Use pre-calculated values
         
         // Update circular buffer
         ads0_history[ch][ads0_hist_idx[ch]] = value;
@@ -398,18 +382,9 @@ void refreshPage(int page) {
         }
       }
     } else {
-      // Normal mode: read ADC and update display
+      // Normal mode: use global ADC values and update display
       for (int ch = 0; ch < 4; ch++) {
-        float value = ads1.computeVolts(ads1.readADC_SingleEnded(ch));
-        
-        // Apply IMON formula for channel 0: IMON = (V/20)*1000 (in mA)
-        if (ch == 0) {
-            value = (value / 20) * 1000;
-        }
-        // Convert A1Cx channels to millivolts for better display
-        if (ch >= 1 && ch <= 3) {
-            value = value * 1000;  // Convert volts to millivolts
-        }
+        float value = ads1_values[ch]; // Use pre-calculated values
         
         // Update circular buffer
         ads1_history[ch][ads1_hist_idx[ch]] = value;
@@ -605,6 +580,11 @@ void loop() {
   // Only refresh if page changed, pause state changed, or if enough time has passed AND not paused
   if (pageChanged || pauseStateChanged || (!currentlyPaused && (now - lastRefresh >= refreshInterval))) {
     lastRefresh = now;
+    
+    // Always print key channels first for serial plotter
+    printKeyChannels();
+    
+    // Then refresh the page display
     refreshPage(page);
   }
 
@@ -631,6 +611,75 @@ int getPage() {
 // Function to check if pages 1 and 2 should be paused
 bool checkPauseState() {
   return !digitalRead(pinD5);  // LOW (GND) = paused, HIGH (5V) = normal
+}
+
+// Function to read all ADC channels and print for serial plotter
+void printKeyChannels() {
+  // Read all ADS0 channels and store globally
+  for (int ch = 0; ch < 4; ch++) {
+    ads0_raw[ch] = ads0.readADC_SingleEnded(ch);
+    ads0_volts[ch] = ads0.computeVolts(ads0_raw[ch]);
+    
+    if (ch == 0) { // VTEC
+      ads0_values[ch] = 2.0 * (ads0_volts[ch] - 2.5) * 1000.0;
+    } else if (ch == 1) { // ITEC
+      ads0_values[ch] = 2.0 * (ads0_volts[ch] - 2.5) * 1000.0;
+    } else if (ch == 2 || ch == 3) { // TSET, TACT
+      float v_offset = ads0_volts[ch] - 1.65;
+      float numerator = 4.096 - v_offset;
+      float denominator = 4.096 + v_offset;
+      if (numerator > 0 && denominator > 0) {
+        float temp_kelvin = 1.0 / ((1.0/beta) * log(numerator/denominator) + 1.0/(25.0+273.15));
+        ads0_values[ch] = temp_kelvin - 273.15;
+      } else {
+        ads0_values[ch] = -999.0;
+      }
+    }
+  }
+
+  // Read all ADS1 channels and store globally
+  for (int ch = 0; ch < 4; ch++) {
+    ads1_raw[ch] = ads1.readADC_SingleEnded(ch);
+    ads1_volts[ch] = ads1.computeVolts(ads1_raw[ch]);
+    
+    if (ch == 0) { // IMON
+      ads1_values[ch] = (ads1_volts[ch] / 20) * 1000;
+    } else { // A1C1, A1C2, A1C3
+      ads1_values[ch] = ads1_volts[ch] * 1000; // Convert to mV for display
+    }
+  }
+
+  // --- Print in required order ---
+  Serial.print("VTEC:"); Serial.print(ads0_values[0], 2);
+  Serial.print(",ITEC:"); Serial.print(ads0_values[1], 2);
+  Serial.print(",TSET:"); Serial.print(ads0_values[2], 2);
+  Serial.print(",TACT:"); Serial.print(ads0_values[3], 2);
+  Serial.print(",IMON:"); Serial.print(ads1_values[0], 2);
+  Serial.print(",Tz:"); Serial.print(tecConnected ? tecSetTemp : 0.0, 2);
+  Serial.print(",Tr:"); Serial.print(tecConnected ? tecActualTemp : 0.0, 2);
+  Serial.print(",PW:"); Serial.print(tecConnected ? tecOutputPower : 0.0, 1);
+
+  // --- Print raw/volts for key channels ---
+  Serial.print(",VTECR:"); Serial.print(ads0_raw[0]);
+  Serial.print(",VTECV:"); Serial.print(ads0_volts[0], 4);
+  Serial.print(",ITECR:"); Serial.print(ads0_raw[1]);
+  Serial.print(",ITECV:"); Serial.print(ads0_volts[1], 4);
+  Serial.print(",TSETR:"); Serial.print(ads0_raw[2]);
+  Serial.print(",TSETV:"); Serial.print(ads0_volts[2], 4);
+  Serial.print(",TACTR:"); Serial.print(ads0_raw[3]);
+  Serial.print(",TACTV:"); Serial.print(ads0_volts[3], 4);
+  Serial.print(",IMONR:"); Serial.print(ads1_raw[0]);
+  Serial.print(",IMONV:"); Serial.print(ads1_volts[0], 4);
+
+  // --- Print A1Cx at the end ---
+  Serial.print(",A1C1R:"); Serial.print(ads1_raw[1]);
+  Serial.print(",A1C1V:"); Serial.print(ads1_volts[1], 4);
+  Serial.print(",A1C2R:"); Serial.print(ads1_raw[2]);
+  Serial.print(",A1C2V:"); Serial.print(ads1_volts[2], 4);
+  Serial.print(",A1C3R:"); Serial.print(ads1_raw[3]);
+  Serial.print(",A1C3V:"); Serial.print(ads1_volts[3], 4);
+
+  Serial.println();
 }
 
 // Function to read TEC controller data  
@@ -672,173 +721,74 @@ void readTECController() {
     }
   }
   
-  // Parse TEC response - handle both Basic and Advanced formats
+  // Parse TEC response - Basic format only
   if (response.length() > 0) {
     tecConnected = true;
     tecFailCount = 0;
     rawTecResponse = response; // Store raw response
-    
-    // Output raw TEC response to computer serial
     Serial.print(F("TEC_RAW: "));
     Serial.println(response);
     
-    // Store raw response for display (debug output reduced)
+    // Reset values to defaults
+    tecSetTemp = 0.0;
+    tecActualTemp = 0.0;
+    tecPIDProportional = 0.0;
+    tecPIDIntegral = 0.0;
+    tecPIDDerivative = 0.0;
+    tecOutputPower = 0.0;
+    tecOpenCollector = false;
     
-    String cleanResponse = response;
-    cleanResponse.trim();
+    // C-style parsing to avoid String overhead and sscanf issues
+    char buffer[response.length() + 1];
+    response.toCharArray(buffer, sizeof(buffer));
+
+    char *p;
+    p = strstr(buffer, "Tz="); if(p) tecSetTemp = atof(p + 3);
+    p = strstr(buffer, "P="); if(p) tecPIDProportional = atof(p + 2);
+    p = strstr(buffer, "I="); if(p) tecPIDIntegral = atof(p + 2);
+    p = strstr(buffer, "D="); if(p) tecPIDDerivative = atof(p + 2);
+    p = strstr(buffer, "Tr="); if(p) tecActualTemp = atof(p + 3);
+    p = strstr(buffer, "OC="); if(p) tecOpenCollector = (atoi(p + 3) != 0);
     
-    // Validate response completeness before parsing
-    // Check that all required parameters are present with values
-    bool isComplete = true;
-    if (cleanResponse.indexOf("Tz=") == -1) isComplete = false;
-    if (cleanResponse.indexOf("P=") == -1) isComplete = false;
-    if (cleanResponse.indexOf("I=") == -1) isComplete = false;
-    if (cleanResponse.indexOf("D=") == -1) isComplete = false;
-    if (cleanResponse.indexOf("Tr=") == -1) isComplete = false;
-    if (cleanResponse.indexOf("OC=") == -1) isComplete = false;
-    if (cleanResponse.indexOf("PW=") == -1) isComplete = false;
-    
-    // Check that PW has a value (not just "PW=" at the end)
-    int pwPos = cleanResponse.indexOf("PW=");
-    if (pwPos != -1) {
-      int nextParamPos = cleanResponse.indexOf(" OC=", pwPos);
-      if (nextParamPos == -1) nextParamPos = cleanResponse.length();
-      String pwCheck = cleanResponse.substring(pwPos + 3, nextParamPos);
-      pwCheck.trim();
-      pwCheck.replace(" ", "");
-      if (pwCheck.length() == 0) isComplete = false; // PW= with no value
+    p = strstr(buffer, "PW=");
+    if (p) {
+        char *pw_ptr = p + 3; // "PW=" is 3 chars
+        // Handle "+ 25" case by removing space after sign
+        if ((*pw_ptr == '+' || *pw_ptr == '-') && *(pw_ptr + 1) == ' ') {
+            memmove(pw_ptr + 1, pw_ptr + 2, strlen(pw_ptr + 2) + 1);
+        }
+        tecOutputPower = atof(pw_ptr);
     }
-    
-    if (!isComplete) {
-      Serial.println(F("TEC_INCOMPLETE: Ignoring incomplete response"));
-      return; // Skip parsing and keep previous values
-    }
-    
-    // Parse Basic format: Tz=25.01 P=5.09 I=2.02 D=1.01 Tr=25.72 OC=0 PW=100
-    if (cleanResponse.indexOf("Tz=") != -1) {
-        int pos;
-        
-        // Parse temperature setpoint (Tz)
-        pos = cleanResponse.indexOf("Tz=");
-        if (pos != -1) {
-          pos += 3; // Skip "Tz="
-          int end = cleanResponse.indexOf(' ', pos);
-          if (end == -1) end = cleanResponse.length();
-          tecSetTemp = cleanResponse.substring(pos, end).toFloat();
-        }
-        
-        // Parse actual temperature (Tr)  
-        pos = cleanResponse.indexOf("Tr=");
-        if (pos != -1) {
-          pos += 3; // Skip "Tr="
-          int end = cleanResponse.indexOf(' ', pos);
-          if (end == -1) end = cleanResponse.length();
-          tecActualTemp = cleanResponse.substring(pos, end).toFloat();
-        }
-        
-                // Parse PID parameters - handle spaces and signs in TEC format
-        pos = cleanResponse.indexOf("P=");
-        if (pos != -1) {
-          pos += 2; // Skip "P="
-          // Skip any spaces after the equals
-          while (pos < cleanResponse.length() && cleanResponse[pos] == ' ') pos++;
-          int end = cleanResponse.indexOf(' ', pos);
-          if (end == -1) end = cleanResponse.length();
-          tecPIDProportional = cleanResponse.substring(pos, end).toFloat();
-        }
-        
-        pos = cleanResponse.indexOf("I=");
-        if (pos != -1) {
-          pos += 2; // Skip "I="
-          // Skip any spaces after the equals
-          while (pos < cleanResponse.length() && cleanResponse[pos] == ' ') pos++;
-          int end = cleanResponse.indexOf(' ', pos);
-          if (end == -1) end = cleanResponse.length();
-          tecPIDIntegral = cleanResponse.substring(pos, end).toFloat();
-        }
-        
-        pos = cleanResponse.indexOf("D=");
-        if (pos != -1) {
-          pos += 2; // Skip "D="
-          // Skip any spaces after the equals
-          while (pos < cleanResponse.length() && cleanResponse[pos] == ' ') pos++;
-          int end = cleanResponse.indexOf(' ', pos);
-          if (end == -1) end = cleanResponse.length();
-          tecPIDDerivative = cleanResponse.substring(pos, end).toFloat();
-        }
-          
-        // Parse PWM output (PW) - handle spaces, + and - signs with spaces
-        pos = cleanResponse.indexOf("PW=");
-        if (pos != -1) {
-          pos += 3; // Skip "PW="
-          
-          // Find the end of the PW value (next parameter or end of string)
-          int nextParam = cleanResponse.indexOf(" OC=", pos);
-          if (nextParam == -1) nextParam = cleanResponse.length();
-          
-          // Extract the PW value substring
-          String pwValue = cleanResponse.substring(pos, nextParam);
-          pwValue.trim(); // Remove leading/trailing spaces
-          
-          // Handle the case where there are spaces in the value (e.g., "- 47")
-          pwValue.replace(" ", ""); // Remove all internal spaces
-          
-          if (pwValue.length() > 0) {
-            tecOutputPower = pwValue.toFloat();
-          } else {
-            tecOutputPower = 0; // Empty value
-          }
-        }
-          
-        // Debug output for parsed PID values
-        Serial.print(F("TEC_PARSED: P="));
-        Serial.print(tecPIDProportional, 2);
-        Serial.print(F(" I="));
-        Serial.print(tecPIDIntegral, 2);
-        Serial.print(F(" D="));
-        Serial.print(tecPIDDerivative, 2);
-        Serial.print(F(" PW="));
-        Serial.println(tecOutputPower, 0);
-        
-        // Parse open collector (OC)
-        pos = cleanResponse.indexOf("OC=");
-        if (pos != -1) {
-          pos += 3; // Skip "OC="
-          int end = cleanResponse.indexOf(' ', pos);
-          if (end == -1) end = cleanResponse.length();
-          tecOpenCollector = (cleanResponse.substring(pos, end).toFloat() > 0.5);
-        }
-      } else {
-        Serial.print(F("TEC: Unknown format: '"));
-        Serial.print(cleanResponse);
-        Serial.println(F("'"));
-      }
-    
-    // Show connection status only when re-connecting after failures
-    if (tecFailCount > 0) {
-      Serial.print(F("TEC: Connected! Set="));
-      Serial.print(tecSetTemp, 1);
-      Serial.print(F("°C Act="));
-      Serial.print(tecActualTemp, 1);
-      Serial.println(F("°C"));
-    }
-    
+
+    // Debug output for parsed values
+    Serial.print(F("TEC_PARSED: Tz="));
+    Serial.print(tecSetTemp, 2);
+    Serial.print(F(" Tr="));
+    Serial.print(tecActualTemp, 2);
+    Serial.print(F(" P="));
+    Serial.print(tecPIDProportional, 2);
+    Serial.print(F(" I="));
+    Serial.print(tecPIDIntegral, 2);
+    Serial.print(F(" D="));
+    Serial.print(tecPIDDerivative, 2);
+    Serial.print(F(" OC="));
+    Serial.print(tecOpenCollector ? 1 : 0);
+    Serial.print(F(" PW="));
+    Serial.println(tecOutputPower, 0);
   } else {
     // No response - mark as disconnected
     tecConnected = false;
     tecFailCount++;
-    rawTecResponse = ""; // Clear stale response
-    
-         if (tecFailCount == 5) {
-       Serial.print(F("TEC: No response ("));
-       Serial.print(tecFailCount);
-       Serial.println(F(" consecutive failures)"));
-     } else if (tecFailCount % 20 == 0) {
-       // Report failure count every 20 failures
-       Serial.print(F("TEC: Still no response ("));
-       Serial.print(tecFailCount);
-       Serial.println(F(" failures)"));
-     }
+    rawTecResponse = "";
+    if (tecFailCount == 5) {
+      Serial.print(F("TEC: No response ("));
+      Serial.print(tecFailCount);
+      Serial.println(F(" consecutive failures)"));
+    } else if (tecFailCount % 20 == 0) {
+      Serial.print(F("TEC: Still no response ("));
+      Serial.print(tecFailCount);
+      Serial.println(F(" failures)"));
+    }
   }
 }
 
