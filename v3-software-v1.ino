@@ -475,23 +475,41 @@ void refreshPage(int page) {
       lcd.print(iBuf);
       lcd.print(" "); // Clear rest of line
       
-      // Line 2: PID D only
+      // Line 2: PID D and Open Collector
       lcd.setCursor(0, 2);
       char dBuf[6];
       formatPID(tecPIDDerivative, dBuf);
-      lcd.print("           D =");
+      lcd.print(" OC=");
+      lcd.print(oc);
+      lcd.print("      D =");
       lcd.print(dBuf);
       lcd.print(" "); // Clear rest of line
       
-      // Line 3: Power and Open Collector
+      // Line 3: Heating/Cooling status and percentage
       lcd.setCursor(0, 3);
-      char pwBuf[5];
-      formatNumber(pw, pwBuf, 4);
-      lcd.print(" PW=");
-      lcd.print(pwBuf);
-      lcd.print("   OC=");
-      lcd.print(oc);
-      lcd.print("    "); // Clear rest of line
+      int pwPercent = (int)abs(pw); // Convert to integer percentage
+      
+      // Show heating or cooling based on power sign
+      if (pw >= 0) {
+        lcd.print(" Heating");
+      } else {
+        lcd.print(" Cooling");
+      }
+      
+      lcd.print("   PW=");
+
+      // Calculate spaces needed to right-align percentage
+      String percentStr = String(pwPercent) + "%";
+      int usedChars = 8 + 6; // " Heating" (8) + "   PW=" (6) = 14 chars used
+      int spacesNeeded = 20 - usedChars - percentStr.length() - 1;
+      
+      // Print spaces to right-align the percentage
+      for (int i = 0; i < spacesNeeded; i++) {
+        lcd.print(" ");
+      }
+      
+      // Print the percentage
+      lcd.print(percentStr);
       
     } else {
       // Level shifter enabled but no TEC response
