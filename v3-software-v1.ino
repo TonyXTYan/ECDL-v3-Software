@@ -125,6 +125,7 @@ void formatPID(float value, char* buffer) {
   buffer[5] = '\0';
 }
 
+
 // Function to format number for compact display (width 2-8 characters including decimal)
 void formatNumber(float value, char* buffer, int width = 6) {
   // Clamp width to valid range
@@ -164,7 +165,7 @@ void formatNumber(float value, char* buffer, int width = 6) {
     decimalPlaces = max(1, availableWidth - intDigits - 1); // -1 for decimal point
     
     // Cap decimal places to reasonable limit
-    decimalPlaces = min(decimalPlaces, 3);
+    decimalPlaces = min(decimalPlaces, 5);  // Allow up to 5 decimal places for voltage precision
   }
 
   // Format the number with exact width and decimal places
@@ -176,6 +177,15 @@ void formatNumber(float value, char* buffer, int width = 6) {
     int len = strlen(buffer);
     memmove(buffer + 1, buffer, len + 1);
     buffer[0] = '-';
+  }
+  
+  // Remove leading spaces for better display (dtostrf right-aligns with spaces)
+  char* start = buffer;
+  while (*start == ' ' && start < buffer + width) {
+    start++;
+  }
+  if (start != buffer) {
+    memmove(buffer, start, strlen(start) + 1);
   }
   
   // Ensure we don't exceed width and null terminate
@@ -286,17 +296,22 @@ void refreshPage(int page) {
       for (int ch = 0; ch < 4; ch++) {
         lcd.setCursor(0, ch);
         char buf[8], chName[5];
-        formatNumber(lastAverages_ads0[ch], buf, 7);
+        // TSET and TACT are always positive, can use more characters for averages
+        if (ch == 2 || ch == 3) {
+          formatNumber(lastAverages_ads0[ch], buf, 7);  // TSET and TACT: one more decimal place
+        } else {
+          formatNumber(lastAverages_ads0[ch], buf, 6);  // VTEC and ITEC averages
+        }
         getChannelName(chName, false, ch);
         lcd.print(chName); lcd.print(":PAUSED~");
         lcd.print(buf);
         // Use appropriate units for each channel
-        if (ch == 1) {
-          lcd.print("A");  // ITEC in amperes
+        if (ch == 0) {
+          lcd.print("mV");  // VTEC in millivolts
+        } else if (ch == 1) {
+          lcd.print("mA");  // ITEC in milliamperes
         } else if (ch == 2 || ch == 3) {
           lcd.print("C");  // TSET and TACT in Celsius
-        } else {
-          lcd.print("V");  // VTEC in volts
         }
       }
     } else {
@@ -304,13 +319,13 @@ void refreshPage(int page) {
       for (int ch = 0; ch < 4; ch++) {
         float value = ads0.computeVolts(ads0.readADC_SingleEnded(ch));
         
-        // Apply VTEC formula for channel 0: VTEC = 2*(V-2.5)
+        // Apply VTEC formula for channel 0: VTEC = 2*(V-2.5) * 1000 (convert to mV)
         if (ch == 0) {
-          value = 2.0 * (value - 2.5);
+          value = 2.0 * (value - 2.5) * 1000.0;
         }
-        // Apply ITEC formula for channel 1: ITEC = 2*(V-2.5)
+        // Apply ITEC formula for channel 1: ITEC = 2*(V-2.5) * 1000 (convert to mA)
         if (ch == 1) {
-          value = 2.0 * (value - 2.5);
+          value = 2.0 * (value - 2.5) * 1000.0;
         }
         // Apply temperature formula for channels 2 and 3: TSET and TACT
         // T = (1/beta * ln((4.096-(V-1.65))/(4.096+(V-1.65))) + 1/(25+273.15))^-1
@@ -342,20 +357,26 @@ void refreshPage(int page) {
         
         // Display current / average, compact
         lcd.setCursor(0, ch);
-        char buf1[7], buf2[8], chName[5];
-        formatNumber(value, buf1);
-        formatNumber(avg, buf2, 7);
+        char buf1[8], buf2[8], chName[5];
+        // TSET and TACT are always positive, can use more characters for averages
+        if (ch == 2 || ch == 3) {
+          formatNumber(value, buf1, 6);  // Temperature current values
+          formatNumber(avg, buf2, 7);    // Temperature averages with one more decimal place
+        } else {
+          formatNumber(value, buf1, 6);  // Current values
+          formatNumber(avg, buf2, 6);    // VTEC and ITEC averages
+        }
         getChannelName(chName, false, ch);
         lcd.print(chName); lcd.print(":");
         lcd.print(buf1); lcd.print("~");
         lcd.print(buf2); 
         // Use appropriate units for each channel
-        if (ch == 1) {
-          lcd.print("A");  // ITEC in amperes
+        if (ch == 0) {
+          lcd.print("mV");  // VTEC in millivolts
+        } else if (ch == 1) {
+          lcd.print("mA");  // ITEC in milliamperes
         } else if (ch == 2 || ch == 3) {
           lcd.print("C");  // TSET and TACT in Celsius
-        } else {
-          lcd.print("V");  // VTEC in volts
         }
       }
     }
@@ -365,7 +386,7 @@ void refreshPage(int page) {
       for (int ch = 0; ch < 4; ch++) {
         lcd.setCursor(0, ch);
         char buf[8], chName[5];
-        formatNumber(lastAverages_ads1[ch], buf, ch == 0 ? 6 : 7);  // IMON gets 6 chars, others get 7
+        formatNumber(lastAverages_ads1[ch], buf, ch == 0 ? 6 : 6);  // IMON gets 6, A1Cx get 6 (now in mV)
         getChannelName(chName, true, ch);
         lcd.print(chName); lcd.print(":PAUSED~");
         lcd.print(buf);
@@ -373,7 +394,7 @@ void refreshPage(int page) {
         if (ch == 0) {
           lcd.print("mA");  // IMON in milliamperes
         } else {
-          lcd.print("V");  // Other channels in volts
+          lcd.print("mV");  // A1Cx channels in millivolts
         }
       }
     } else {
@@ -384,6 +405,10 @@ void refreshPage(int page) {
         // Apply IMON formula for channel 0: IMON = (V/20)*1000 (in mA)
         if (ch == 0) {
             value = (value / 20) * 1000;
+        }
+        // Convert A1Cx channels to millivolts for better display
+        if (ch >= 1 && ch <= 3) {
+            value = value * 1000;  // Convert volts to millivolts
         }
         
         // Update circular buffer
@@ -401,8 +426,8 @@ void refreshPage(int page) {
         // Display current / average, compact
         lcd.setCursor(0, ch);
         char buf1[7], buf2[8], chName[5];
-        formatNumber(value, buf1);
-        formatNumber(avg, buf2, ch == 0 ? 6 : 7);  // IMON gets 6 chars, others get 7
+        formatNumber(value, buf1, 6);  // All live values get one more decimal place
+        formatNumber(avg, buf2, ch == 0 ? 6 : 6);  // IMON gets 6, A1Cx get 6 (now in mV)
         getChannelName(chName, true, ch);
         lcd.print(chName); lcd.print(":");
         lcd.print(buf1); lcd.print("~");
@@ -411,7 +436,7 @@ void refreshPage(int page) {
         if (ch == 0) {
           lcd.print("mA");  // IMON in milliamperes
         } else {
-          lcd.print("V");  // Other channels in volts
+          lcd.print("mV");  // A1Cx channels in millivolts
         }
       }
     }
