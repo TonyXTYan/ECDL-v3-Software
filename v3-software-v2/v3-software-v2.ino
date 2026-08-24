@@ -67,6 +67,13 @@ int lastPage = 0;
 unsigned long lastRefresh = 0; // For 2Hz throttle
 const unsigned long refreshInterval = 500; // ms
 
+// AVR Wire otherwise waits forever if the I2C bus locks. The ACT T MON
+// safety decision is deliberately made with analogRead(A0), but that
+// independence only helps if an I2C call eventually returns.
+const unsigned long I2C_WIRE_TIMEOUT_US = 25000;
+const unsigned long ADS_CONVERSION_TIMEOUT_MS = 50;
+bool i2cHealthy = true;
+
 // Global variables for ADC readings (updated by printKeyChannels)
 float ads0_values[4] = {0.0, 0.0, 0.0, 0.0}; // VTEC, ITEC, TSET, TACT
 float ads1_values[4] = {0.0, 0.0, 0.0, 0.0}; // IMON, ACTM, SETM, A1C3
@@ -485,6 +492,54 @@ void trapWithInterlock()
 }
 
 
+// Record a Wire-level timeout and stop issuing further I2C operations.
+// The display/ADS telemetry remains unavailable until reset, while the
+// independent A0 interlock continues to run.
+bool checkI2cTimeout()
+{
+  if (!Wire.getWireTimeoutFlag()) return false;
+
+  Wire.clearWireTimeoutFlag();
+  i2cHealthy = false;
+  return true;
+}
+
+
+// Adafruit_ADS1X15::readADC_SingleEnded() waits indefinitely for its
+// conversion-ready bit. Bound both the underlying Wire transactions and
+// that higher-level polling loop so an absent or wedged ADS cannot starve
+// serviceInterlock().
+bool readAdsSingleEnded(Adafruit_ADS1115 &adc, uint8_t channel, int16_t &raw)
+{
+  static const uint16_t muxByChannel[4] = {
+    ADS1X15_REG_CONFIG_MUX_SINGLE_0,
+    ADS1X15_REG_CONFIG_MUX_SINGLE_1,
+    ADS1X15_REG_CONFIG_MUX_SINGLE_2,
+    ADS1X15_REG_CONFIG_MUX_SINGLE_3
+  };
+
+  if (!i2cHealthy || channel > 3) return false;
+
+  Wire.clearWireTimeoutFlag();
+  adc.startADCReading(muxByChannel[channel], false);
+  if (checkI2cTimeout()) return false;
+
+  unsigned long started = millis();
+  while (!adc.conversionComplete()) {
+    serviceInterlock();
+    if (checkI2cTimeout()) return false;
+    if (millis() - started >= ADS_CONVERSION_TIMEOUT_MS) {
+      i2cHealthy = false;
+      return false;
+    }
+  }
+
+  if (checkI2cTimeout()) return false;
+  raw = adc.getLastConversionResults();
+  return !checkI2cTimeout();
+}
+
+
 // ============================================================
 // Display helpers
 // ============================================================
@@ -618,6 +673,10 @@ void setup() {
   // it means temperature control blips on every Serial Monitor
   // connection. See the retrofit guide.
   Serial.begin(38400);
+
+  // Abort and reset the AVR TWI peripheral if a slave or the bus wedges.
+  // This must be configured before any LCD/ADS operation.
+  Wire.setWireTimeout(I2C_WIRE_TIMEOUT_US, true);
 
   // LCD init
   lcd.init();
@@ -860,13 +919,18 @@ void loop() {
   bool pauseStateChanged = (currentlyPaused != lastPauseState);
 
   if (pageChanged) {
-    lcd.clear(); // Only clear when page changes
+    if (i2cHealthy) {
+      lcd.clear(); // Only clear when page changes
+      checkI2cTimeout();
+    }
     lastPage = page;
     lastRefresh = now; // Reset refresh timer so next regular update is in 500ms
   }
 
-  // Only refresh if page changed, pause state changed, or if enough time has passed AND not paused
-  if (pageChanged || pauseStateChanged || (!currentlyPaused && (now - lastRefresh >= refreshInterval))) {
+  // D5 pauses only the two moving-average pages. On system/interlock
+  // pages, both the display and serial telemetry continue while it is LOW.
+  bool pauseAppliesToPage = currentlyPaused && (page == 1 || page == 2);
+  if (pageChanged || pauseStateChanged || (!pauseAppliesToPage && (now - lastRefresh >= refreshInterval))) {
     lastRefresh = now;
 
     // SET T MON (display only) -- read on the display cadence
@@ -876,7 +940,7 @@ void loop() {
     printKeyChannels();
 
     // Then refresh the page display
-    refreshPage(page);
+    if (i2cHealthy) refreshPage(page);
   }
 
   // Update the last pause state
@@ -904,7 +968,9 @@ void printKeyChannels() {
   // Read all ADS0 channels and store globally
   for (int ch = 0; ch < 4; ch++) {
     serviceInterlock();   // ~8 ms per single-shot read: keep the interlock fed
-    ads0_raw[ch] = ads0.readADC_SingleEnded(ch);
+    int16_t raw;
+    if (!readAdsSingleEnded(ads0, ch, raw)) break;
+    ads0_raw[ch] = raw;
     ads0_volts[ch] = ads0.computeVolts(ads0_raw[ch]);
     
     if (ch == 0) { // VTEC
@@ -927,7 +993,9 @@ void printKeyChannels() {
   // Read all ADS1 channels and store globally
   for (int ch = 0; ch < 4; ch++) {
     serviceInterlock();
-    ads1_raw[ch] = ads1.readADC_SingleEnded(ch);
+    int16_t raw;
+    if (!readAdsSingleEnded(ads1, ch, raw)) break;
+    ads1_raw[ch] = raw;
     ads1_volts[ch] = ads1.computeVolts(ads1_raw[ch]);
     
     if (ch == 0) { // IMON
@@ -943,9 +1011,8 @@ void printKeyChannels() {
   }
 
   // 16-bit view of the PTC monitors -- display/logging only. The
-  // interlock never trips on these: they arrive over I2C, and Wire
-  // has no bus timeout, so a stuck bus must not be able to stall the
-  // safety decision.
+  // interlock never trips on these: they arrive over bounded I2C calls,
+  // while the independent A0 path remains authoritative.
   ptcActV_ADS = ads1_values[1] / 1000.0;
   ptcSetV_ADS = ads1_values[2] / 1000.0;
 
@@ -966,6 +1033,7 @@ void printKeyChannels() {
   Serial.print(",PSETC:"); Serial.print(ptcMonVoltsToC(ptcSetV_A0), 2);
   Serial.print(",PEN:"); Serial.print(ilkEnableOut ? 1 : 0);
   Serial.print(",PFLT:"); Serial.print(ilkFaultLatched ? 1 : 0);
+  Serial.print(",PI2C:"); Serial.print(i2cHealthy ? 1 : 0);
 
   // --- Print raw/volts for key channels ---
   Serial.print(",VTECR:"); Serial.print(ads0_raw[0]);

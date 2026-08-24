@@ -39,7 +39,7 @@ Build size, Arduino Nano (`arduino:avr:nano`):
 | | Flash | RAM |
 |---|---|---|
 | v1 | 22168 B (72%) | 1559 B (76%) -- IDE warns "low memory" |
-| v2 | 17812 B (57%) | 1389 B (67%) -- no warning |
+| v2 | 18084 B (58%) | 1397 B (68%) -- no warning |
 
 **Left untouched and still deployed elsewhere:** `ECDL-v3-Software v1/v3-software-v1.ino`
 and `PTC-voltage-interlock/PTC-voltage-interlock.ino`. Do not "sync" changes into them.
@@ -59,7 +59,7 @@ headers and no existing wire moves.
 | A1 | 3.3 V level-shifter sense | **SET T MON** via identical divider |
 | A2 | — | **MANUAL enable switch** in |
 | A3 | — | spare |
-| D5 | pause toggle | unchanged |
+| D5 | pause toggle | pages 1/2 only; pages 0/3 keep updating |
 | D6 / D7 | page select | unchanged |
 | D8 | — | spare (add a fault output here if wanted) |
 | D9 | TXS0108E `OE` | **PTC ENABLE** out |
@@ -116,10 +116,11 @@ Two rules behind this arrangement:
 
 - The ADS1115 must tap the **divider node, never the raw monitor**: 0-6 V exceeds the
   ±4.096 V GAIN_ONE range (and the ADS input limit of VDD+0.3 V).
-- The trip decision reads **A0 only** and never touches I2C. `Wire` has no bus timeout,
-  so a stuck I2C bus must not be able to stall the safety path. The ADS reading exists so
-  a wiring or calibration problem shows up as a visible disagreement on page 3, not so
-  the interlock can use it.
+- The trip decision reads **A0 only** and never uses an I2C result. Firmware also enables
+  the AVR `Wire` transaction timeout and bounds the ADS1115 conversion-ready polling
+  loop. If the bus or an ADS wedges, further I2C monitoring is abandoned until reset and
+  the A0 interlock continues running. The ADS reading exists so a wiring or calibration
+  problem shows up as a visible disagreement on page 3, not so the interlock can use it.
 
 ADS1115 input impedance is ~6 MΩ, so tapping the same node loads the divider negligibly.
 
@@ -246,18 +247,28 @@ in-range 9-sample median window before ENABLE may go HIGH.
 
 This is the one behavioral difference from the standalone sketch. There, one ADC sample
 was taken per `loop()` pass. Here `loop()` blocks: eight ADS1115 single-shot reads take
-~70 ms and an LCD refresh tens of ms. So sampling is gated to a fixed **5 ms** interval by
-`serviceInterlock()`, which is also called from *inside* those blocking sections — the
-ADS read loops, between LCD row writes, and in the ADS-init failure trap.
+~70 ms and an LCD refresh tens of ms. So sampling is nominally gated to a **5 ms**
+interval by `serviceInterlock()`, which is also called from inside the ADS read loops,
+between LCD row writes, and in the ADS-init failure trap. I2C transactions have a 25 ms
+timeout and ADS conversion polling has a 50 ms timeout; after either failure, firmware
+stops further I2C work until reset so the analog interlock can continue.
 
 Consequences:
 
-- The 9-sample median window is a predictable **~45 ms**, not a function of display load.
-- The 10 Hz fault flash stays even during a page refresh.
+- Outside serial emission, the 9-sample median window is typically **~45 ms** and the
+  10 Hz fault flash remains responsive during ADS/LCD work.
 - A sustained excursion still latches within ~1 s regardless of what the display is doing.
 - If the ADS1115 fails to initialise, the sketch traps with the LCD error message **but
   keeps servicing the interlock** — it depends on neither I2C nor the ADS1115, so PTC
   protection survives their failure.
+
+**Serial timing quirk.** The CSV record is longer than the AVR hardware-serial transmit
+buffer. At 38400 baud, `Serial.print()` therefore blocks for tens of milliseconds once
+per 500 ms refresh while the UART drains. `serviceInterlock()` cannot run during that
+short burst, so an individual sample and a fault-LED transition may be late by roughly
+one telemetry burst. The elapsed-time fault debounce still applies and resumes on the
+next service call. This is accepted for the present firmware; reducing telemetry,
+raising the baud rate, or making transmission non-blocking would remove the jitter.
 
 ### 5.3 Page 3 -- PTC10K-CH page (replaces the TEC page)
 
@@ -294,6 +305,7 @@ the raw/volts block:
 | `PACTC`, `PSETC` | derived °C (**uncalibrated**, see §6) |
 | `PEN` | 1 = ENABLE asserted |
 | `PFLT` | 1 = fault latched |
+| `PI2C` | 1 = LCD/ADS bus healthy; 0 = I2C abandoned until reset |
 | `ACTMR`/`ACTMV`, `SETMR`/`SETMV` | raw counts and volts at the ADS taps |
 
 ---
@@ -357,7 +369,7 @@ capacitor on RESET) if the blip is unacceptable, accepting that flashing then re
 manual reset.
 
 **Auto-enable at power-up.** If power is applied with the manual switch already ON and the
-temperature in range, ENABLE goes HIGH after the ~45 ms qualification window without
+temperature in range, ENABLE goes HIGH after the ~50 ms qualification window without
 operator action. This is by design, and unchanged from the standalone interlock.
 
 ---
@@ -377,11 +389,14 @@ still disconnected for steps 1-6.
    input bad.
 4. **Fail-safe states.** ENABLE stays LOW through power-up, reset, unpowered, the first
    fresh median window after OFF->ON, and OFF->ON while already out of range.
-5. **Jitter check** — the whole point of `serviceInterlock()`. Hold a fault while cycling
-   pages and toggling pause, and confirm the 10 Hz flash stays visibly even and the trip
-   still happens within ~1 s during LCD refreshes and ADS reads.
-6. **ADS failure path.** Pull ADS1115 #1 and confirm the LCD shows the failure message
-   while the interlock still trips and flashes normally.
+5. **Jitter check.** Hold a fault while cycling pages and toggling pause. Confirm pages
+   0/3 and serial continue updating while D5 is LOW, the flash remains responsive during
+   LCD/ADS work, and the trip still happens at about 1 s. A brief flash jitter coincident
+   with each serial CSV burst is the documented quirk above.
+6. **ADS/I2C failure path.** Boot with ADS1115 #1 absent and confirm the LCD shows the
+   initialisation failure while the interlock still trips and flashes normally. Then
+   boot with the bus healthy, interrupt it at runtime, and confirm `PI2C` becomes 0,
+   further LCD/ADS work stops, and the A0 interlock still trips and flashes normally.
 7. **On the real controller.** Connect PTC ENABLE (1k series, 10k pulldown) and re-run
    steps 3-4 against the PTC10K-CH itself. Then collect the resistance/temperature pairs
    for §6.2 and fit beta.
