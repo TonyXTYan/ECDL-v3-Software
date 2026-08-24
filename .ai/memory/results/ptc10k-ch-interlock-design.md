@@ -80,6 +80,21 @@ constants involved, this delay is expected to be negligible for the interlock's
 purpose — call this assumption out explicitly if the hardware ever changes to
 something with a much faster thermal fault mode.
 
+**Fault-LED display during the pre-qualification warm-up.** While the median
+buffer is refilling (at power-up, or for the brief ~9-sample window right after
+a manual OFF->ON edge), `ENABLE` stays LOW unconditionally — but the fault LEDs
+during that window are driven from the *raw, unfiltered* instantaneous reading
+rather than being forced off. This matters because forcing them off during
+warm-up would make a real, ongoing fault look momentarily cleared (LEDs go
+dark) right at the moment the switch is flipped, and would also make a
+perfectly good signal flicker on and back off for no reason. Falling back to
+the raw reading avoids both: a genuine fault stays visibly indicated the whole
+time, a genuinely good signal never flickers. The trade-off is that this raw
+reading is susceptible to single-sample noise for those few iterations, which
+is acceptable since it only drives a status LED — `ENABLE` and the
+qualification/debounce logic are unaffected and still require the full,
+median-filtered window.
+
 ### Fault behavior
 
 If the manual switch is ON and ACT T MON leaves the allowed range continuously for
@@ -631,12 +646,26 @@ void loop()
   // Read ACT T MON (rolling median of last MEDIAN_WINDOW samples)
   // ==========================================================
 
-  sampleBuf[sampleIdx] = analogRead(PIN_TEMP);
+  int rawAdc = analogRead(PIN_TEMP);
+
+  sampleBuf[sampleIdx] = rawAdc;
   sampleIdx++;
   if (sampleIdx >= MEDIAN_WINDOW) {
     sampleIdx = 0;
     bufferFull = true;
   }
+
+  // Instantaneous (unfiltered) reading, used only to drive the fault
+  // LEDs during the brief warm-up before a full median window is
+  // available -- so a real fault doesn't briefly go dark, and a good
+  // signal doesn't briefly flicker on, while ENABLE stays gated on
+  // the debounced/qualified median value regardless.
+  float vActRaw =
+    (rawAdc * ADC_REF_V / 1023.0) / DIVIDER_RATIO;
+
+  bool rawTempOK =
+    (vActRaw >= V_LOW) &&
+    (vActRaw <= V_HIGH);
 
   // Until the buffer has a full window of real samples, treat the
   // reading as not-OK (fail-safe: ENABLE stays LOW, its power-up
@@ -698,10 +727,12 @@ void loop()
 
   // Do not start the debounce timer or enable the PTC until a full
   // median window is available. setup() has already driven ENABLE LOW.
+  // Fault LEDs fall back to the raw instantaneous reading here so a
+  // real fault stays visibly indicated (not blanked) through warm-up.
   if (!bufferFull) {
     digitalWrite(PIN_ENABLE, LOW);
     digitalWrite(PIN_LED_OK, LOW);
-    setFaultLEDs(false);
+    setFaultLEDs(!rawTempOK);
     return;
   }
 

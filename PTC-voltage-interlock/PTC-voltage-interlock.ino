@@ -135,12 +135,26 @@ void loop()
   // Read ACT T MON (rolling median of last MEDIAN_WINDOW samples)
   // ==========================================================
 
-  sampleBuf[sampleIdx] = analogRead(PIN_TEMP);
+  int rawAdc = analogRead(PIN_TEMP);
+
+  sampleBuf[sampleIdx] = rawAdc;
   sampleIdx++;
   if (sampleIdx >= MEDIAN_WINDOW) {
     sampleIdx = 0;
     bufferFull = true;
   }
+
+  // Instantaneous (unfiltered) reading, used only to drive the fault
+  // LEDs during the brief warm-up before a full median window is
+  // available -- so a real fault doesn't briefly go dark, and a good
+  // signal doesn't briefly flicker on, while ENABLE stays gated on
+  // the debounced/qualified median value regardless.
+  float vActRaw =
+    (rawAdc * ADC_REF_V / 1023.0) / DIVIDER_RATIO;
+
+  bool rawTempOK =
+    (vActRaw >= V_LOW) &&
+    (vActRaw <= V_HIGH);
 
   // Until the buffer has a full window of real samples, treat the
   // reading as not-OK (fail-safe: ENABLE stays LOW, its power-up
@@ -202,10 +216,12 @@ void loop()
 
   // Do not start the debounce timer or enable the PTC until a full
   // median window is available. setup() has already driven ENABLE LOW.
+  // Fault LEDs fall back to the raw instantaneous reading here so a
+  // real fault stays visibly indicated (not blanked) through warm-up.
   if (!bufferFull) {
     digitalWrite(PIN_ENABLE, LOW);
     digitalWrite(PIN_LED_OK, LOW);
-    setFaultLEDs(false);
+    setFaultLEDs(!rawTempOK);
     return;
   }
 
