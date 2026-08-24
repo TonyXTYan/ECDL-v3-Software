@@ -207,7 +207,10 @@ PTC10K-CH COMMON + 5 V regulator GND + Arduino GND + 12 V supply GND
 8. **Confirm the common ground** per §3.5.
 9. **Flash** `v3-software-v2/v3-software-v2.ino` (Arduino IDE, or
    `arduino-cli compile --fqbn arduino:avr:nano v3-software-v2`). Required libraries:
-   `Wire`, `Adafruit_ADS1X15`, `LiquidCrystal_I2C`. `SoftwareSerial` is no longer needed.
+   `Wire`, `Adafruit_ADS1X15` **>= 2.0** (the I2C-recovery code uses the async
+   `startADCReading()`/`conversionComplete()`/`getLastConversionResults()` API, which does
+   not exist in the older 1.x releases), `LiquidCrystal_I2C`. `SoftwareSerial` is no longer
+   needed.
 
 ### Pre-power checklist
 
@@ -219,6 +222,11 @@ PTC10K-CH COMMON + 5 V regulator GND + Arduino GND + 12 V supply GND
 - [ ] A4/A5 untouched; LCD and both ADS1115s still respond.
 - [ ] Manual switch reads HIGH when ON and LOW when OFF, at the pin.
 - [ ] PTC ENABLE still physically disconnected (reconnect in verification step 7).
+- [ ] `Adafruit_ADS1X15` library is >= 2.0 and the `arduino:avr` board package is recent
+      enough to provide `Wire.setWireTimeout()`/`getWireTimeoutFlag()`/
+      `clearWireTimeoutFlag()` (added ~2021); an older cached copy of either will fail to
+      compile, not fail silently. `arduino-cli compile --fqbn arduino:avr:nano
+      v3-software-v2` is a quick way to confirm before touching hardware.
 
 ---
 
