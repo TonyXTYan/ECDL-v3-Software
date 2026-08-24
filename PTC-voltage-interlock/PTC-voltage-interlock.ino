@@ -3,6 +3,8 @@
 // Classic 5 V Arduino Uno / Nano (ATmega328P)
 // ============================================================
 
+#include <string.h>
+
 const uint8_t PIN_TEMP   = A0;
 const uint8_t PIN_MANUAL = 2;
 const uint8_t PIN_ENABLE = 3;
@@ -42,6 +44,59 @@ const float V_LOW  = 0.750;
 const float V_HIGH = 1.400;
 
 
+// ---------------- ADC noise rejection ----------------
+
+// Rolling median over the last N raw ADC samples (one new sample per
+// loop pass). Rejects single-sample spikes (ADC noise, EMI) without
+// adding hysteresis to the V_LOW/V_HIGH trip thresholds themselves.
+// Window is a time span, not a fixed duration: it scales with how
+// fast loop() runs, so it stays negligible only as long as loop()
+// stays unblocked (no added delay()s).
+const uint8_t MEDIAN_WINDOW = 9;
+
+int sampleBuf[MEDIAN_WINDOW];
+uint8_t sampleIdx = 0;
+bool bufferFull = false;
+
+// Fault only latches after this many consecutive milliseconds of
+// out-of-range readings, so a brief spike that slips past the median
+// filter still can't trip the fault. A genuine, sustained excursion
+// still latches within ~1 s.
+const unsigned long FAULT_DEBOUNCE_MS = 1000;
+
+bool outOfRangeActive = false;
+unsigned long outOfRangeStart = 0;
+
+// Becomes true only after a complete median window reports an
+// in-range temperature while the manual switch is ON. This prevents
+// startup or a manual reset from enabling an already-faulty system.
+bool enableQualified = false;
+
+// Tracks the manual switch edge so each OFF->ON cycle must collect a
+// fresh median window before it can qualify ENABLE.
+bool manualWasON = false;
+
+
+// Insertion sort a copy of the buffer and return the middle element.
+int median9(const int *buf)
+{
+  int sorted[MEDIAN_WINDOW];
+  memcpy(sorted, buf, sizeof(sorted));
+
+  for (uint8_t i = 1; i < MEDIAN_WINDOW; i++) {
+    int key = sorted[i];
+    int j = i;
+    while (j > 0 && sorted[j - 1] > key) {
+      sorted[j] = sorted[j - 1];
+      j--;
+    }
+    sorted[j] = key;
+  }
+
+  return sorted[MEDIAN_WINDOW / 2];
+}
+
+
 // ---------------- Fault state ----------------
 
 bool faultLatched = false;
@@ -77,20 +132,35 @@ void setup()
 void loop()
 {
   // ==========================================================
-  // Read ACT T MON
+  // Read ACT T MON (rolling median of last MEDIAN_WINDOW samples)
   // ==========================================================
 
-  int adc = analogRead(PIN_TEMP);
+  sampleBuf[sampleIdx] = analogRead(PIN_TEMP);
+  sampleIdx++;
+  if (sampleIdx >= MEDIAN_WINDOW) {
+    sampleIdx = 0;
+    bufferFull = true;
+  }
 
-  float vA0 =
-    adc * ADC_REF_V / 1023.0;
+  // Until the buffer has a full window of real samples, treat the
+  // reading as not-OK (fail-safe: ENABLE stays LOW, its power-up
+  // default, through the brief startup warm-up).
+  bool tempOK = false;
+  float vAct = 0.0;
 
-  float vAct =
-    vA0 / DIVIDER_RATIO;
+  if (bufferFull) {
+    int adc = median9(sampleBuf);
 
-  bool tempOK =
-    (vAct >= V_LOW) &&
-    (vAct <= V_HIGH);
+    float vA0 =
+      adc * ADC_REF_V / 1023.0;
+
+    vAct =
+      vA0 / DIVIDER_RATIO;
+
+    tempOK =
+      (vAct >= V_LOW) &&
+      (vAct <= V_HIGH);
+  }
 
   bool manualON =
     (digitalRead(PIN_MANUAL) == HIGH);
@@ -102,8 +172,13 @@ void loop()
 
   if (!manualON)
   {
-    // Pulling manual switch to GND resets the fault latch.
+    // Pulling manual switch to GND resets the fault latch and the
+    // debounce timer, so a stale timer can't fire an instant latch
+    // on the next switch-ON.
     faultLatched = false;
+    outOfRangeActive = false;
+    enableQualified = false;
+    manualWasON = false;
 
     // PTC always disabled while manual switch is OFF.
     digitalWrite(PIN_ENABLE, LOW);
@@ -116,13 +191,44 @@ void loop()
   }
 
 
+  // Discard samples from before this switch-ON edge. A stale in-range
+  // median must not briefly enable a system whose current input is bad.
+  if (!manualWasON) {
+    manualWasON = true;
+    sampleIdx = 0;
+    bufferFull = false;
+  }
+
+
+  // Do not start the debounce timer or enable the PTC until a full
+  // median window is available. setup() has already driven ENABLE LOW.
+  if (!bufferFull) {
+    digitalWrite(PIN_ENABLE, LOW);
+    digitalWrite(PIN_LED_OK, LOW);
+    setFaultLEDs(false);
+    return;
+  }
+
+
   // ==========================================================
   // MANUAL SWITCH ON
   // ==========================================================
 
-  // Any out-of-range event latches the fault.
+  // Fault only latches after FAULT_DEBOUNCE_MS of continuous
+  // out-of-range readings; a single bad reading (or one the median
+  // filter missed) that clears on the next pass never latches.
   if (!tempOK) {
-    faultLatched = true;
+    if (!outOfRangeActive) {
+      outOfRangeActive = true;
+      outOfRangeStart = millis();
+    } else if (millis() - outOfRangeStart >= FAULT_DEBOUNCE_MS) {
+      faultLatched = true;
+    }
+  } else {
+    outOfRangeActive = false;
+    if (!faultLatched) {
+      enableQualified = true;
+    }
   }
 
 
@@ -130,11 +236,21 @@ void loop()
   // NORMAL ENABLED STATE
   // ==========================================================
 
-  if (!faultLatched && tempOK)
+  // Once an in-range reading has qualified the enabled state, gate
+  // only on faultLatched so a brief out-of-range reading inside the
+  // debounce window does not drop ENABLE. Before qualification (at
+  // startup or after manual OFF), ENABLE remains LOW.
+  if (!faultLatched)
   {
-    digitalWrite(PIN_ENABLE, HIGH);
-    digitalWrite(PIN_LED_OK, HIGH);
-    setFaultLEDs(false);
+    if (enableQualified) {
+      digitalWrite(PIN_ENABLE, HIGH);
+      digitalWrite(PIN_LED_OK, HIGH);
+      setFaultLEDs(false);
+    } else {
+      digitalWrite(PIN_ENABLE, LOW);
+      digitalWrite(PIN_LED_OK, LOW);
+      setFaultLEDs(!tempOK);
+    }
 
     return;
   }

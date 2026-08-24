@@ -1,9 +1,9 @@
 ---
-date: 2026-08-19
+date: 2026-08-24
 status: settled
 ---
 
-Hardware/firmware design for an Arduino interlock that gates a Wavelength PTC10K-CH's ENABLE line on ACT T MON voltage (0.750-1.400 V), with a latching fault requiring manual switch OFF->ON reset before re-enable. Implemented and matches `PTC-voltage-interlock/PTC-voltage-interlock.ino`.
+Hardware/firmware design for an Arduino interlock that gates a Wavelength PTC10K-CH's ENABLE line on ACT T MON voltage (0.750-1.400 V), with a latching fault requiring manual switch OFF->ON reset before re-enable. Startup and every manual OFF->ON transition require a fresh, complete, in-range median window before ENABLE can go HIGH. Once enabled, the ADC read is noise-rejected with a rolling 9-sample median, and a fault only latches after 1 s of continuous out-of-range readings (debounce on time, not a hysteresis band on the voltage thresholds). Implemented and matches `PTC-voltage-interlock/PTC-voltage-interlock.ino`.
 
 # PTC10K-CH Hardware Temperature-Interlock Design Note
 
@@ -30,23 +30,62 @@ There is deliberately **no hysteresis**.
 
 ### Enable logic
 
-The PTC enable output may be HIGH only when:
+The PTC may enter its enabled state only when:
 
 1. the manual enable switch is ON,
 2. ACT T MON is within 0.750–1.400 V,
 3. no fault is currently latched.
 
-Logical form:
+After startup or manual OFF, the firmware discards earlier samples and requires a
+fresh, complete median window with an in-range reading before it sets
+`ENABLE_QUALIFIED` and permits ENABLE to go HIGH.
+Once qualified, ENABLE remains HIGH during a sub-1-second out-of-range debounce
+window; a sustained excursion latches the fault and drives it LOW. In stateful
+logical form:
 
 ```text
-PTC_ENABLE = MANUAL_ENABLE && TEMP_IN_RANGE && !FAULT_LATCHED
+PTC_ENABLE = MANUAL_ENABLE && ENABLE_QUALIFIED && !FAULT_LATCHED
 ```
+
+`ENABLE_QUALIFIED` is cleared by manual OFF and is set only by a complete,
+median-filtered in-range reading. It remains set during the debounce window so a
+brief excursion does not interrupt operation.
+
+### ADC noise rejection and fault debounce
+
+A single noisy ADC sample (mux/conversion noise, EMI) must not be able to trip the
+fault on its own, since the fault is a latch that requires a manual reset. Two
+independent filters guard against this, neither of which touches the 0.750/1.400 V
+trip thresholds themselves:
+
+1. **Rolling median.** Each `loop()` pass takes one fresh `analogRead()` and pushes
+   it into a 9-sample circular buffer; the ADC value used for the voltage
+   reconstruction is the median of that buffer, not the raw instantaneous sample.
+   A single outlier sample is rejected outright as long as it isn't more than 4 of
+   the last 9 readings. Until the buffer has collected a full 9 samples at power-up
+   or after an OFF->ON switch transition, the reading is treated as fail-safe
+   not-OK, so ENABLE stays LOW through that brief qualification period.
+2. **Time debounce on the latch.** After the median buffer is full, the
+   (median-filtered) reading must be
+   continuously out of range for **1000 ms** before the fault actually latches.
+   If ENABLE was already qualified by an in-range reading, it remains HIGH during
+   that debounce window. At startup or after manual OFF, an out-of-range reading
+   does not qualify ENABLE, so it remains LOW while the same timer runs. If the
+   reading returns in-range before 1 s elapses, the timer resets and nothing latches.
+
+This means a genuine, sustained ACT T MON excursion still disables the PTC within
+about a second, at the cost of that ~1 s of added response latency versus the
+previous design's near-instant trip. Given the PTC/thermistor thermal time
+constants involved, this delay is expected to be negligible for the interlock's
+purpose — call this assumption out explicitly if the hardware ever changes to
+something with a much faster thermal fault mode.
 
 ### Fault behavior
 
-If the manual switch is ON and ACT T MON leaves the allowed range:
+If the manual switch is ON and ACT T MON leaves the allowed range continuously for
+at least 1 second (after the rolling-median filter):
 
-- PTC ENABLE is immediately driven LOW,
+- PTC ENABLE is driven LOW,
 - green/OK LED turns OFF,
 - the fault is **latched**,
 - all connected red fault LEDs flash at **10 Hz** while ACT T MON remains out of range.
@@ -69,14 +108,17 @@ To clear a latched fault:
 When the switch is OFF:
 
 - PTC ENABLE is LOW,
-- the fault latch is cleared,
+- the fault latch is cleared, and the debounce timer is also cleared (so a
+  timer that was already running before the switch went OFF can't fire a
+  stale, instant latch right after the switch goes back ON),
 - if ACT T MON is still out of range, fault LEDs remain **solid ON**,
 - if ACT T MON is in range, fault LEDs are OFF.
 
 When the switch is switched ON again:
 
 - if ACT T MON is in range, the PTC is enabled,
-- if ACT T MON is still out of range, a fault is immediately latched again.
+- if ACT T MON is still out of range, ENABLE remains LOW, the debounce timer starts
+  fresh, and a fault latches after another 1 s of continuous out-of-range reading.
 
 This gives an intentional operator-reset requirement after a fault.
 
@@ -391,12 +433,14 @@ A larger margin is preferable.
 | OFF | in range | cleared | LOW | OFF | OFF |
 | OFF | out of range | cleared | LOW | OFF | solid ON |
 | ON | in range, no previous fault | clear | HIGH | ON | OFF |
-| ON | out of range | set | LOW | OFF | flash 10 Hz |
+| ON, previously qualified | out of range < 1 s (debounce window) | not yet set | HIGH | ON | OFF |
+| ON | out of range >= 1 s continuous | set | LOW | OFF | flash 10 Hz |
 | ON | recovered after fault | remains set | LOW | OFF | flash 1 Hz |
 | OFF after a fault | in range | cleared | LOW | OFF | OFF |
 | OFF after a fault | out of range | cleared | LOW | OFF | solid ON |
 | OFF -> ON, in range | clear | HIGH | ON | OFF |
-| OFF -> ON, out of range | immediately set | LOW | OFF | flash 10 Hz |
+| OFF -> ON, out of range < 1 s | clear | LOW | OFF | solid ON |
+| OFF -> ON, out of range >= 1 s continuous | set | LOW | OFF | flash 10 Hz |
 
 ---
 
@@ -409,7 +453,13 @@ Fault sequence:
 ```text
 NORMAL
   |
-ACT T MON exits 0.75-1.4 V
+ACT T MON exits 0.75-1.4 V (median-filtered)
+  |
+  v
+DEBOUNCE WINDOW (up to 1 s)
+EN stays HIGH
+  |
+still out of range after 1 s continuous
   |
   v
 FAULT LATCHED
@@ -433,7 +483,8 @@ manual switch -> ON
   |
   +-- ACT in range --> EN HIGH
   |
-  +-- ACT out of range --> fault immediately latched again
+  +-- ACT out of range --> EN remains LOW
+                           fault latches after 1 s continuous
 ```
 
 This prevents an uncontrolled automatic restart after a temperature excursion.
@@ -447,6 +498,8 @@ This prevents an uncontrolled automatic restart after a temperature excursion.
 // PTC10K-CH Temperature Interlock
 // Classic 5 V Arduino Uno / Nano (ATmega328P)
 // ============================================================
+
+#include <string.h>
 
 const uint8_t PIN_TEMP   = A0;
 const uint8_t PIN_MANUAL = 2;
@@ -465,25 +518,79 @@ const uint8_t NUM_FAULT_LEDS =
   sizeof(FAULT_LED_PINS) / sizeof(FAULT_LED_PINS[0]);
 
 
-// ---------------- ADC / voltage divider ----------------
+// ---------------- ADC / divider ----------------
 
-const float ADC_REF_V = 5.000f;
+// Measure your actual regulated 5 V rail if you want better accuracy.
+const float ADC_REF_V = 5.000;
 
-// Measured external divider:
-// ACT T MON -- 21.73k -- A0 -- 47.31k -- GND
+// External divider:
+// ACT T MON -- 22k -- A0 -- 47k -- GND
 //
-// PTC10K-CH ACT T MON has approximately 1k output impedance.
+// PTC ACT T MON itself has ~1k output impedance,
+// so effective upper resistance is 22k + 1k.
 
-const float R_TOP_K     = 21.73f;
-const float R_PTC_OUT_K = 1.00f;
-const float R_BOTTOM_K  = 47.31f;
+const float R_TOP_K     = 21.73;
+const float R_PTC_OUT_K = 1.00;
+const float R_BOTTOM_K  = 47.31;
 
 const float DIVIDER_RATIO =
-  R_BOTTOM_K /
-  (R_BOTTOM_K + R_TOP_K + R_PTC_OUT_K);
+  R_BOTTOM_K / (R_BOTTOM_K + R_TOP_K + R_PTC_OUT_K);
 
-const float V_LOW  = 0.750f;
-const float V_HIGH = 1.400f;
+const float V_LOW  = 0.750;
+const float V_HIGH = 1.400;
+
+
+// ---------------- ADC noise rejection ----------------
+
+// Rolling median over the last N raw ADC samples (one new sample per
+// loop pass). Rejects single-sample spikes (ADC noise, EMI) without
+// adding hysteresis to the V_LOW/V_HIGH trip thresholds themselves.
+// Window is a time span, not a fixed duration: it scales with how
+// fast loop() runs, so it stays negligible only as long as loop()
+// stays unblocked (no added delay()s).
+const uint8_t MEDIAN_WINDOW = 9;
+
+int sampleBuf[MEDIAN_WINDOW];
+uint8_t sampleIdx = 0;
+bool bufferFull = false;
+
+// Fault only latches after this many consecutive milliseconds of
+// out-of-range readings, so a brief spike that slips past the median
+// filter still can't trip the fault. A genuine, sustained excursion
+// still latches within ~1 s.
+const unsigned long FAULT_DEBOUNCE_MS = 1000;
+
+bool outOfRangeActive = false;
+unsigned long outOfRangeStart = 0;
+
+// Becomes true only after a complete median window reports an
+// in-range temperature while the manual switch is ON. This prevents
+// startup or a manual reset from enabling an already-faulty system.
+bool enableQualified = false;
+
+// Tracks the manual switch edge so each OFF->ON cycle must collect a
+// fresh median window before it can qualify ENABLE.
+bool manualWasON = false;
+
+
+// Insertion sort a copy of the buffer and return the middle element.
+int median9(const int *buf)
+{
+  int sorted[MEDIAN_WINDOW];
+  memcpy(sorted, buf, sizeof(sorted));
+
+  for (uint8_t i = 1; i < MEDIAN_WINDOW; i++) {
+    int key = sorted[i];
+    int j = i;
+    while (j > 0 && sorted[j - 1] > key) {
+      sorted[j] = sorted[j - 1];
+      j--;
+    }
+    sorted[j] = key;
+  }
+
+  return sorted[MEDIAN_WINDOW / 2];
+}
 
 
 // ---------------- Fault state ----------------
@@ -520,82 +627,163 @@ void setup()
 
 void loop()
 {
-  // Read ACT T MON
-  int adc = analogRead(PIN_TEMP);
+  // ==========================================================
+  // Read ACT T MON (rolling median of last MEDIAN_WINDOW samples)
+  // ==========================================================
 
-  float vA0 =
-    adc * ADC_REF_V / 1023.0f;
+  sampleBuf[sampleIdx] = analogRead(PIN_TEMP);
+  sampleIdx++;
+  if (sampleIdx >= MEDIAN_WINDOW) {
+    sampleIdx = 0;
+    bufferFull = true;
+  }
 
-  float vAct =
-    vA0 / DIVIDER_RATIO;
+  // Until the buffer has a full window of real samples, treat the
+  // reading as not-OK (fail-safe: ENABLE stays LOW, its power-up
+  // default, through the brief startup warm-up).
+  bool tempOK = false;
+  float vAct = 0.0;
 
-  bool tempOK =
-    (vAct >= V_LOW) &&
-    (vAct <= V_HIGH);
+  if (bufferFull) {
+    int adc = median9(sampleBuf);
+
+    float vA0 =
+      adc * ADC_REF_V / 1023.0;
+
+    vAct =
+      vA0 / DIVIDER_RATIO;
+
+    tempOK =
+      (vAct >= V_LOW) &&
+      (vAct <= V_HIGH);
+  }
 
   bool manualON =
     (digitalRead(PIN_MANUAL) == HIGH);
 
 
+  // ==========================================================
   // MANUAL SWITCH OFF
+  // ==========================================================
+
   if (!manualON)
   {
-    // Pulling manual switch to GND resets the fault latch.
+    // Pulling manual switch to GND resets the fault latch and the
+    // debounce timer, so a stale timer can't fire an instant latch
+    // on the next switch-ON.
     faultLatched = false;
+    outOfRangeActive = false;
+    enableQualified = false;
+    manualWasON = false;
 
     // PTC always disabled while manual switch is OFF.
     digitalWrite(PIN_ENABLE, LOW);
     digitalWrite(PIN_LED_OK, LOW);
 
-    // Bad temperature while manually disabled -> solid fault LEDs.
+    // If temperature is still bad, fault LEDs stay solid ON.
     setFaultLEDs(!tempOK);
 
     return;
   }
 
 
-  // MANUAL SWITCH ON:
-  // any excursion outside the allowed range latches a fault.
-  if (!tempOK)
-  {
-    faultLatched = true;
+  // Discard samples from before this switch-ON edge. A stale in-range
+  // median must not briefly enable a system whose current input is bad.
+  if (!manualWasON) {
+    manualWasON = true;
+    sampleIdx = 0;
+    bufferFull = false;
   }
 
 
-  // NORMAL ENABLED STATE
-  if (!faultLatched && tempOK)
-  {
-    digitalWrite(PIN_ENABLE, HIGH);
-    digitalWrite(PIN_LED_OK, HIGH);
+  // Do not start the debounce timer or enable the PTC until a full
+  // median window is available. setup() has already driven ENABLE LOW.
+  if (!bufferFull) {
+    digitalWrite(PIN_ENABLE, LOW);
+    digitalWrite(PIN_LED_OK, LOW);
     setFaultLEDs(false);
+    return;
+  }
+
+
+  // ==========================================================
+  // MANUAL SWITCH ON
+  // ==========================================================
+
+  // Fault only latches after FAULT_DEBOUNCE_MS of continuous
+  // out-of-range readings; a single bad reading (or one the median
+  // filter missed) that clears on the next pass never latches.
+  if (!tempOK) {
+    if (!outOfRangeActive) {
+      outOfRangeActive = true;
+      outOfRangeStart = millis();
+    } else if (millis() - outOfRangeStart >= FAULT_DEBOUNCE_MS) {
+      faultLatched = true;
+    }
+  } else {
+    outOfRangeActive = false;
+    if (!faultLatched) {
+      enableQualified = true;
+    }
+  }
+
+
+  // ==========================================================
+  // NORMAL ENABLED STATE
+  // ==========================================================
+
+  // Once an in-range reading has qualified the enabled state, gate
+  // only on faultLatched so a brief out-of-range reading inside the
+  // debounce window does not drop ENABLE. Before qualification (at
+  // startup or after manual OFF), ENABLE remains LOW.
+  if (!faultLatched)
+  {
+    if (enableQualified) {
+      digitalWrite(PIN_ENABLE, HIGH);
+      digitalWrite(PIN_LED_OK, HIGH);
+      setFaultLEDs(false);
+    } else {
+      digitalWrite(PIN_ENABLE, LOW);
+      digitalWrite(PIN_LED_OK, LOW);
+      setFaultLEDs(!tempOK);
+    }
 
     return;
   }
 
 
+  // ==========================================================
   // FAULT-LATCHED STATE
+  // ==========================================================
+
   digitalWrite(PIN_ENABLE, LOW);
   digitalWrite(PIN_LED_OK, LOW);
 
 
   if (!tempOK)
   {
+    // Currently outside 0.75–1.4 V
+    //
     // 10 Hz:
     // full period = 100 ms
     // half period = 50 ms
+
     bool flashState =
-      ((millis() / 50UL) % 2UL) == 0;
+      ((millis() / 50) % 2) == 0;
 
     setFaultLEDs(flashState);
   }
   else
   {
-    // Temperature recovered but fault remains latched.
+    // Temperature has recovered,
+    // but fault remains latched.
+    //
     // 1 Hz:
     // full period = 1000 ms
     // half period = 500 ms
+
     bool flashState =
-      ((millis() / 500UL) % 2UL) == 0;
+      ((millis() / 500) % 2) == 0;
 
     setFaultLEDs(flashState);
   }
@@ -620,9 +808,9 @@ The relevant numerical limitation is ADC resolution and calibration, not overflo
 
 ---
 
-## No hysteresis
+## No hysteresis (but there is a time debounce — these are different things)
 
-There is deliberately no hysteresis in this design.
+There is deliberately no hysteresis on the voltage thresholds in this design.
 
 The valid/recovery range is exactly:
 
@@ -633,6 +821,14 @@ The valid/recovery range is exactly:
 After a latched fault, entering this range changes the fault indication from 10 Hz to 1 Hz, but does **not** re-enable the PTC.
 
 Re-enable still requires a manual OFF -> ON reset cycle.
+
+Separately, the firmware does debounce the *fault-latching decision* in time (see
+"ADC noise rejection and fault debounce" above): a reading must be continuously
+out of range for 1 s before it latches. This is not hysteresis — the trip boundary
+is still exactly 0.750/1.400 V with no dead band, and a value on the wrong side of
+that boundary for the full 1 s always latches. The debounce only rejects a *brief*
+excursion (a spike shorter than 1 s that returns in-range on its own), which the
+no-hysteresis design was never intended to protect against in the first place.
 
 ---
 
@@ -657,6 +853,8 @@ Before final commissioning:
    - Arduino boots
    - Arduino resets
    - Arduino is unpowered
+   - the first fresh median window is collected after manual OFF -> ON
+   - ACT T MON is already out of range when manual OFF -> ON occurs
 
 ---
 
