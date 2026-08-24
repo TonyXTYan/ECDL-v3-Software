@@ -39,7 +39,7 @@ Build size, Arduino Nano (`arduino:avr:nano`):
 | | Flash | RAM |
 |---|---|---|
 | v1 | 22168 B (72%) | 1559 B (76%) -- IDE warns "low memory" |
-| v2 | 18084 B (58%) | 1397 B (68%) -- no warning |
+| v2 | 18876 B (61%) | 1424 B (69%) -- no warning |
 
 **Left untouched and still deployed elsewhere:** `ECDL-v3-Software v1/v3-software-v1.ino`
 and `PTC-voltage-interlock/PTC-voltage-interlock.ino`. Do not "sync" changes into them.
@@ -118,9 +118,10 @@ Two rules behind this arrangement:
   ±4.096 V GAIN_ONE range (and the ADS input limit of VDD+0.3 V).
 - The trip decision reads **A0 only** and never uses an I2C result. Firmware also enables
   the AVR `Wire` transaction timeout and bounds the ADS1115 conversion-ready polling
-  loop. If the bus or an ADS wedges, further I2C monitoring is abandoned until reset and
-  the A0 interlock continues running. The ADS reading exists so a wiring or calibration
-  problem shows up as a visible disagreement on page 3, not so the interlock can use it.
+  loop. If the bus or an ADS wedges, LCD/ADS work goes offline and bounded recovery runs
+  in the background while the A0 interlock continues. The ADS reading exists so a wiring
+  or calibration problem shows up as a visible disagreement on page 3, not so the
+  interlock can use it.
 
 ADS1115 input impedance is ~6 MΩ, so tapping the same node loads the divider negligibly.
 
@@ -249,18 +250,34 @@ This is the one behavioral difference from the standalone sketch. There, one ADC
 was taken per `loop()` pass. Here `loop()` blocks: eight ADS1115 single-shot reads take
 ~70 ms and an LCD refresh tens of ms. So sampling is nominally gated to a **5 ms**
 interval by `serviceInterlock()`, which is also called from inside the ADS read loops,
-between LCD row writes, and in the ADS-init failure trap. I2C transactions have a 25 ms
-timeout and ADS conversion polling has a 50 ms timeout; after either failure, firmware
-stops further I2C work until reset so the analog interlock can continue.
+between LCD characters, and during background recovery. I2C transactions have a 25 ms
+timeout and ADS conversion polling has a 50 ms timeout; after either failure, normal I2C
+work stops so the analog interlock can continue without waiting on the bus.
 
 Consequences:
 
 - Outside serial emission, the 9-sample median window is typically **~45 ms** and the
   10 Hz fault flash remains responsive during ADS/LCD work.
 - A sustained excursion still latches within ~1 s regardless of what the display is doing.
-- If the ADS1115 fails to initialise, the sketch traps with the LCD error message **but
-  keeps servicing the interlock** — it depends on neither I2C nor the ADS1115, so PTC
-  protection survives their failure.
+- If an ADS1115 fails to initialise, setup returns into the normal loop with I2C marked
+  offline. The interlock starts normally and background recovery begins; PTC protection
+  depends on neither I2C nor the ADS1115.
+
+**Automatic I2C recovery.** While I2C is offline, firmware retries every 2 s. Each attempt
+releases the AVR TWI peripheral, supplies up to nine SCL recovery pulses and a STOP,
+restarts `Wire`, and probes the LCD plus both ADS1115 addresses. A failed transaction is
+still bounded by 25 ms, and `serviceInterlock()` runs between probes. Once all three
+devices acknowledge, the ADS library objects are rebound and monitoring resumes without
+resetting the Arduino, clearing the fault latch, or changing PTC ENABLE. Serial reports
+`I2C recovered; LCD/ADS monitoring resumed` and `PI2C` returns to 1.
+
+The LCD library's full initialisation sequence blocks for about 1 s, so firmware never
+runs it while PTC ENABLE is HIGH. If the LCD retained power, ordinary writes generally
+resume after bus recovery. If the LCD itself power-cycled and needs full reinitialisation,
+that step is deferred until ENABLE is already LOW; ADS telemetry and the A0 interlock do
+not wait for it. A peripheral that remains electrically failed or holds a bus line LOW
+will remain offline and be retried—it may still require power-cycling that peripheral,
+but not the Arduino or PTC interlock.
 
 **Serial timing quirk.** The CSV record is longer than the AVR hardware-serial transmit
 buffer. At 38400 baud, `Serial.print()` therefore blocks for tens of milliseconds once
@@ -305,7 +322,7 @@ the raw/volts block:
 | `PACTC`, `PSETC` | derived °C (**uncalibrated**, see §6) |
 | `PEN` | 1 = ENABLE asserted |
 | `PFLT` | 1 = fault latched |
-| `PI2C` | 1 = LCD/ADS bus healthy; 0 = I2C abandoned until reset |
+| `PI2C` | 1 = LCD/ADS bus healthy; 0 = offline with recovery retries active |
 | `ACTMR`/`ACTMV`, `SETMR`/`SETMV` | raw counts and volts at the ADS taps |
 
 ---
@@ -393,10 +410,13 @@ still disconnected for steps 1-6.
    0/3 and serial continue updating while D5 is LOW, the flash remains responsive during
    LCD/ADS work, and the trip still happens at about 1 s. A brief flash jitter coincident
    with each serial CSV burst is the documented quirk above.
-6. **ADS/I2C failure path.** Boot with ADS1115 #1 absent and confirm the LCD shows the
-   initialisation failure while the interlock still trips and flashes normally. Then
-   boot with the bus healthy, interrupt it at runtime, and confirm `PI2C` becomes 0,
-   further LCD/ADS work stops, and the A0 interlock still trips and flashes normally.
+6. **ADS/I2C failure and recovery.** Boot with ADS1115 #1 absent and confirm the
+   interlock still qualifies, trips, and flashes normally while recovery retries. Restore
+   the device without resetting the Arduino and confirm the recovery message, `PI2C=1`,
+   and resumed ADS telemetry. Repeat by interrupting the bus at runtime while ENABLE is
+   HIGH: `PI2C` should become 0, A0 must keep protecting the PTC, and recovery must not
+   blip ENABLE or clear a latched fault. If the LCD itself was power-cycled, confirm its
+   full reinitialisation occurs only after ENABLE is LOW.
 7. **On the real controller.** Connect PTC ENABLE (1k series, 10k pulldown) and re-run
    steps 3-4 against the PTC10K-CH itself. Then collect the resistance/temperature pairs
    for §6.2 and fit beta.

@@ -72,7 +72,10 @@ const unsigned long refreshInterval = 500; // ms
 // independence only helps if an I2C call eventually returns.
 const unsigned long I2C_WIRE_TIMEOUT_US = 25000;
 const unsigned long ADS_CONVERSION_TIMEOUT_MS = 50;
+const unsigned long I2C_RECOVERY_INTERVAL_MS = 2000;
 bool i2cHealthy = true;
+bool lcdNeedsReinit = false;
+unsigned long i2cNextRecoveryAttempt = 0;
 
 // Global variables for ADC readings (updated by printKeyChannels)
 float ads0_values[4] = {0.0, 0.0, 0.0, 0.0}; // VTEC, ITEC, TSET, TACT
@@ -481,27 +484,118 @@ void serviceInterlock()
 }
 
 
-// Halt on an unrecoverable display/ADC failure while KEEPING the
-// interlock running: it depends on neither I2C nor the ADS1115, so
-// PTC protection must survive their failure.
-void trapWithInterlock()
+// Put only the monitoring/display subsystem offline. ENABLE and the A0
+// interlock state are deliberately untouched.
+void markI2cOffline()
 {
-  while (1) {
-    serviceInterlock();
+  if (i2cHealthy) {
+    i2cHealthy = false;
+    lcdNeedsReinit = true;
+    i2cNextRecoveryAttempt = millis() + I2C_RECOVERY_INTERVAL_MS;
   }
 }
 
 
-// Record a Wire-level timeout and stop issuing further I2C operations.
-// The display/ADS telemetry remains unavailable until reset, while the
-// independent A0 interlock continues to run.
+// Record a Wire-level timeout and stop normal I2C operations until the
+// bounded background recovery succeeds.
 bool checkI2cTimeout()
 {
   if (!Wire.getWireTimeoutFlag()) return false;
 
   Wire.clearWireTimeoutFlag();
-  i2cHealthy = false;
+  markI2cOffline();
   return true;
+}
+
+
+// Release the AVR TWI peripheral, clock a slave out of a possibly stuck
+// byte, generate a STOP, and restart Wire. Pins are only ever driven LOW;
+// the external pull-ups provide HIGH, preserving I2C open-drain behaviour.
+void resetI2cBus()
+{
+  Wire.end();
+
+  pinMode(SDA, INPUT_PULLUP);
+  pinMode(SCL, INPUT_PULLUP);
+
+  for (uint8_t pulse = 0; pulse < 9 && digitalRead(SDA) == LOW; pulse++) {
+    pinMode(SCL, OUTPUT);
+    digitalWrite(SCL, LOW);
+    delayMicroseconds(5);
+    pinMode(SCL, INPUT_PULLUP);
+    delayMicroseconds(5);
+  }
+
+  // STOP: SDA low-to-high while SCL is released high.
+  pinMode(SDA, OUTPUT);
+  digitalWrite(SDA, LOW);
+  delayMicroseconds(5);
+  pinMode(SCL, INPUT_PULLUP);
+  delayMicroseconds(5);
+  pinMode(SDA, INPUT_PULLUP);
+  delayMicroseconds(5);
+
+  Wire.begin();
+  Wire.setWireTimeout(I2C_WIRE_TIMEOUT_US, true);
+  Wire.clearWireTimeoutFlag();
+}
+
+
+bool probeI2cAddress(uint8_t address)
+{
+  Wire.clearWireTimeoutFlag();
+  Wire.beginTransmission(address);
+  uint8_t result = Wire.endTransmission();
+  bool timedOut = Wire.getWireTimeoutFlag();
+  Wire.clearWireTimeoutFlag();
+  serviceInterlock();
+  return !timedOut && result == 0;
+}
+
+
+// Retry a failed bus without resetting the MCU or changing PTC ENABLE.
+// One failed probe is bounded by I2C_WIRE_TIMEOUT_US and attempts are
+// rate-limited so a hard fault cannot monopolise the safety loop.
+void serviceI2cRecovery()
+{
+  if (i2cHealthy) {
+    // LiquidCrystal_I2C::init() blocks for about a second. Re-run it only
+    // while PTC ENABLE is already LOW; normal writes may still recover a
+    // display that never lost power in the meantime.
+    if (lcdNeedsReinit && !ilkEnableOut) {
+      lcd.init();
+      lcd.backlight();
+      if (checkI2cTimeout()) return;
+      lcdNeedsReinit = false;
+      lastRefresh = millis() - refreshInterval;
+    }
+    return;
+  }
+
+  unsigned long now = millis();
+  if ((long)(now - i2cNextRecoveryAttempt) < 0) return;
+  i2cNextRecoveryAttempt = now + I2C_RECOVERY_INTERVAL_MS;
+
+  resetI2cBus();
+  serviceInterlock();
+
+  if (!probeI2cAddress(0x27)) return;
+  if (!probeI2cAddress(0x48)) return;
+  if (!probeI2cAddress(0x49)) return;
+
+  // Rebind the library objects after a device power cycle. begin() deletes
+  // its previous helper before allocating a replacement, so retries do not
+  // leak RAM.
+  if (!ads0.begin(0x48) || checkI2cTimeout()) return;
+  serviceInterlock();
+  if (!ads1.begin(0x49) || checkI2cTimeout()) return;
+  serviceInterlock();
+
+  ads0.setGain(GAIN_ONE);
+  ads1.setGain(GAIN_ONE);
+  i2cHealthy = true;
+  lastRefresh = millis() - refreshInterval;
+  Serial.println(F("I2C recovered; LCD/ADS monitoring resumed"));
 }
 
 
@@ -529,7 +623,7 @@ bool readAdsSingleEnded(Adafruit_ADS1115 &adc, uint8_t channel, int16_t &raw)
     serviceInterlock();
     if (checkI2cTimeout()) return false;
     if (millis() - started >= ADS_CONVERSION_TIMEOUT_MS) {
-      i2cHealthy = false;
+      markI2cOffline();
       return false;
     }
   }
@@ -562,10 +656,22 @@ uint8_t ads1_hist_count[4] = {0};
 // truncated at 20. The LCD does not wrap or clear stale characters on
 // its own, so every row must be written full-width.
 void lcdRow(uint8_t row, const char* s) {
+  if (!i2cHealthy) return;
+
   lcd.setCursor(0, row);
+  if (checkI2cTimeout()) return;
+
   uint8_t i = 0;
-  for (; s[i] != '\0' && i < 20; i++) lcd.print(s[i]);
-  for (; i < 20; i++) lcd.print(' ');
+  for (; s[i] != '\0' && i < 20; i++) {
+    lcd.print(s[i]);
+    serviceInterlock();
+    if (checkI2cTimeout()) return;
+  }
+  for (; i < 20; i++) {
+    lcd.print(' ');
+    serviceInterlock();
+    if (checkI2cTimeout()) return;
+  }
 }
 
 // Function to format number for compact display (width 2-8 characters including decimal)
@@ -684,17 +790,35 @@ void setup() {
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print((__FlashStringHelper*)status_initializing);
-
-  // Start ADS1115s with unique I2C addresses
-  if (!ads0.begin(0x48)) {
-    Serial.println(F("Failed to init ADS1115 #0"));
-    lcd.setCursor(0, 1); lcd.print((__FlashStringHelper*)status_ads0_fail);
-    trapWithInterlock();
+  if (checkI2cTimeout()) {
+    Serial.println(F("Failed to init LCD/I2C bus"));
+    return;
   }
-  if (!ads1.begin(0x49)) {
+
+  // Start ADS1115s with unique I2C addresses. A startup failure no longer
+  // traps setup(); loop() keeps the A0 interlock alive and retries I2C.
+  bool ads0Ready = ads0.begin(0x48);
+  bool ads0TimedOut = checkI2cTimeout();
+  if (!ads0Ready || ads0TimedOut) {
+    Serial.println(F("Failed to init ADS1115 #0"));
+    if (i2cHealthy) {
+      lcd.setCursor(0, 1); lcd.print((__FlashStringHelper*)status_ads0_fail);
+      checkI2cTimeout();
+    }
+    markI2cOffline();
+    return;
+  }
+
+  bool ads1Ready = ads1.begin(0x49);
+  bool ads1TimedOut = checkI2cTimeout();
+  if (!ads1Ready || ads1TimedOut) {
     Serial.println(F("Failed to init ADS1115 #1"));
-    lcd.setCursor(0, 2); lcd.print((__FlashStringHelper*)status_ads1_fail);
-    trapWithInterlock();
+    if (i2cHealthy) {
+      lcd.setCursor(0, 2); lcd.print((__FlashStringHelper*)status_ads1_fail);
+      checkI2cTimeout();
+    }
+    markI2cOffline();
+    return;
   }
 
   // Optional: Set gain (both chips)
@@ -721,8 +845,7 @@ void refreshPage(int page) {
       // PAUSED mode: show channel name with "PAUSED" and last average
       for (int ch = 0; ch < 4; ch++) {
         serviceInterlock();
-        lcd.setCursor(0, ch);
-        char buf[8], chName[5];
+        char line[32], buf[8], chName[5];
         // TSET and TACT are always positive, can use more characters for averages
         if (ch == 2 || ch == 3) {
           formatNumber(lastAverages_ads0[ch], buf, 7);  // TSET and TACT: one more decimal place
@@ -730,16 +853,16 @@ void refreshPage(int page) {
           formatNumber(lastAverages_ads0[ch], buf, 6);  // VTEC and ITEC averages
         }
         getChannelName(chName, false, ch);
-        lcd.print(chName); lcd.print(":PAUSED~");
-        lcd.print(buf);
+        strcpy(line, chName); strcat(line, ":PAUSED~"); strcat(line, buf);
         // Use appropriate units for each channel
         if (ch == 0) {
-          lcd.print("mV");  // VTEC in millivolts
+          strcat(line, "mV");  // VTEC in millivolts
         } else if (ch == 1) {
-          lcd.print("mA");  // ITEC in milliamperes
+          strcat(line, "mA");  // ITEC in milliamperes
         } else if (ch == 2 || ch == 3) {
-          lcd.print("C");  // TSET and TACT in Celsius
+          strcat(line, "C");  // TSET and TACT in Celsius
         }
+        lcdRow(ch, line);
       }
     } else {
       // Normal mode: use global ADC values and update display
@@ -760,8 +883,7 @@ void refreshPage(int page) {
         lastAverages_ads0[ch] = avg;
         
         // Display current / average, compact
-        lcd.setCursor(0, ch);
-        char buf1[8], buf2[8], chName[5];
+        char line[32], buf1[8], buf2[8], chName[5];
         // TSET and TACT are always positive, can use more characters for averages
         if (ch == 2 || ch == 3) {
           formatNumber(value, buf1, 6);  // Temperature current values
@@ -771,17 +893,17 @@ void refreshPage(int page) {
           formatNumber(avg, buf2, 6);    // VTEC and ITEC averages
         }
         getChannelName(chName, false, ch);
-        lcd.print(chName); lcd.print(":");
-        lcd.print(buf1); lcd.print("~");
-        lcd.print(buf2); 
+        strcpy(line, chName); strcat(line, ":"); strcat(line, buf1);
+        strcat(line, "~"); strcat(line, buf2);
         // Use appropriate units for each channel
         if (ch == 0) {
-          lcd.print("mV");  // VTEC in millivolts
+          strcat(line, "mV");  // VTEC in millivolts
         } else if (ch == 1) {
-          lcd.print("mA");  // ITEC in milliamperes
+          strcat(line, "mA");  // ITEC in milliamperes
         } else if (ch == 2 || ch == 3) {
-          lcd.print("C");  // TSET and TACT in Celsius
+          strcat(line, "C");  // TSET and TACT in Celsius
         }
+        lcdRow(ch, line);
       }
     }
   } else if (page == 2) {
@@ -789,18 +911,17 @@ void refreshPage(int page) {
       // PAUSED mode: show channel name with "PAUSED" and last average
       for (int ch = 0; ch < 4; ch++) {
         serviceInterlock();
-        lcd.setCursor(0, ch);
-        char buf[8], chName[5];
+        char line[32], buf[8], chName[5];
         formatNumber(lastAverages_ads1[ch], buf, 6);
         getChannelName(chName, true, ch);
-        lcd.print(chName); lcd.print(":PAUSED~");
-        lcd.print(buf);
+        strcpy(line, chName); strcat(line, ":PAUSED~"); strcat(line, buf);
         // Use appropriate units for each channel
         if (ch == 0) {
-          lcd.print("mA");  // IMON in milliamperes
+          strcat(line, "mA");  // IMON in milliamperes
         } else {
-          lcd.print("mV");  // ACTM/SETM monitor mV, A1C3 raw mV
+          strcat(line, "mV");  // ACTM/SETM monitor mV, A1C3 raw mV
         }
+        lcdRow(ch, line);
       }
     } else {
       // Normal mode: use global ADC values and update display
@@ -821,20 +942,19 @@ void refreshPage(int page) {
         lastAverages_ads1[ch] = avg;
         
         // Display current / average, compact
-        lcd.setCursor(0, ch);
-        char buf1[7], buf2[8], chName[5];
+        char line[32], buf1[7], buf2[8], chName[5];
         formatNumber(value, buf1, 6);
         formatNumber(avg, buf2, 6);
         getChannelName(chName, true, ch);
-        lcd.print(chName); lcd.print(":");
-        lcd.print(buf1); lcd.print("~");
-        lcd.print(buf2);
+        strcpy(line, chName); strcat(line, ":"); strcat(line, buf1);
+        strcat(line, "~"); strcat(line, buf2);
         // Use appropriate units for each channel
         if (ch == 0) {
-          lcd.print("mA");  // IMON in milliamperes
+          strcat(line, "mA");  // IMON in milliamperes
         } else {
-          lcd.print("mV");  // ACTM/SETM monitor mV, A1C3 raw mV
+          strcat(line, "mV");  // ACTM/SETM monitor mV, A1C3 raw mV
         }
+        lcdRow(ch, line);
       }
     }
   } else if (page == 3) {
@@ -882,11 +1002,8 @@ void refreshPage(int page) {
     // Page 0: System status/info
     char line[32], st[14];
 
-    lcd.setCursor(0, 0);
-    lcd.print((__FlashStringHelper*)status_system);
-
-    lcd.setCursor(0, 1);
-    lcd.print("ADS0: 0x48  ADS1:0x49");
+    lcdRow(0, "System Status");
+    lcdRow(1, "ADS0:0x48 ADS1:0x49");
 
     // Interlock summary (replaces the v1 D6/D7 pin-state debug line)
     serviceInterlock();
@@ -896,13 +1013,13 @@ void refreshPage(int page) {
     strcat(line, st);
     lcdRow(2, line);
 
-    lcd.setCursor(0, 3);
-    lcd.print("Uptime: ");
     unsigned long uptime = millis() / 1000;
-    lcd.print(uptime); lcd.print("s      ");
+    char uptimeText[11];
+    ultoa(uptime, uptimeText, 10);
+    strcpy(line, "Uptime: "); strcat(line, uptimeText); strcat(line, "s");
+    lcdRow(3, line);
   } else {
-    lcd.setCursor(0, 1);
-    lcd.print((__FlashStringHelper*)status_invalid);
+    lcdRow(1, "Invalid page sel.");
   }
   
   // Turn LED off at end of page refresh
@@ -911,6 +1028,7 @@ void refreshPage(int page) {
 
 void loop() {
   serviceInterlock();
+  serviceI2cRecovery();
 
   int page = getPage();
   bool pageChanged = (page != lastPage);
