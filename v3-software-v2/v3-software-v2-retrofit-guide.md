@@ -92,7 +92,7 @@ PTC J3-3 ACT T MON
         |
         +----------- Arduino A0        (10-bit, interlock trip decision)
         |
-        +----------- ADS1115 #1 ch1    (16-bit, display / logging only)
+        +----------- ADS1115 #1 ch3    (16-bit, display / logging only)
         |
       47.31k
         |
@@ -197,8 +197,8 @@ PTC10K-CH COMMON + 5 V regulator GND + Arduino GND + 12 V supply GND
    entirely — a leftover stub on D9/D10/D11 will now fight the interlock outputs.
 3. **Build the two dividers** (21.73k top / 47.31k bottom each) close to the Arduino, and
    land their nodes on A0 (ACT) and A1 (SET).
-4. **Run the second tap** from each divider node to ADS1115 #1 ch1 (ACT) and ch2 (SET).
-   ADS1 ch3 stays spare.
+4. **Run the second tap** from each divider node to ADS1115 #1 ch3 (ACT) and ch2 (SET) —
+   this is how the bench unit was actually wired; ch1 stays spare (`A1C1`).
 5. **Wire the manual switch** to A2 with its 10k pulldown to GND.
 6. **Wire ENABLE**: D9 through 1k to J3-1, with the 10k pulldown at the PTC end. Leave the
    PTC end disconnected until step 7 of the verification below.
@@ -311,8 +311,9 @@ EN=ON  OK
 - Row 3: `EN=ON/OFF` plus state — `OK`, `WARMUP`, `MANUAL OFF`, `UNQUALIFIED`,
   `FAULT 10Hz`, `FAULT LATCH`.
 
-Other display changes: page 2's `A1C1`/`A1C2` are renamed **`ACTM`/`SETM`** and now read in
-reconstructed monitor mV (the divider is undone in firmware); page 0's D6/D7 pin-state
+Other display changes: page 2's `A1C2`/`A1C3` are renamed **`SETM`/`ACTM`** and now read in
+reconstructed monitor mV (the divider is undone in firmware); `A1C1` stays spare and
+unrenamed. Page 0's D6/D7 pin-state
 debug line is replaced by a one-line interlock summary.
 
 ### 5.4 Serial CSV (38400 baud)

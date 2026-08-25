@@ -26,11 +26,12 @@ const char ads0_ch1_name[] PROGMEM = "ITEC";
 const char ads0_ch2_name[] PROGMEM = "TSET";
 const char ads0_ch3_name[] PROGMEM = "TACT";
 
-// ADS1 ch1/ch2 are now the PTC10K-CH monitor taps (was A1C1/A1C2)
+// ADS1 ch2/ch3 are now the PTC10K-CH monitor taps (was A1C2/A1C3);
+// ch1 stays spare (was A1C1) -- bench wiring landed ACT on ch3, not ch1.
 const char ads1_ch0_name[] PROGMEM = "IMON";
-const char ads1_ch1_name[] PROGMEM = "ACTM";
+const char ads1_ch1_name[] PROGMEM = "A1C1";
 const char ads1_ch2_name[] PROGMEM = "SETM";
-const char ads1_ch3_name[] PROGMEM = "A1C3";
+const char ads1_ch3_name[] PROGMEM = "ACTM";
 
 // Program memory string arrays
 const char* const ads0_channel_names[] PROGMEM = {
@@ -79,7 +80,7 @@ unsigned long i2cNextRecoveryAttempt = 0;
 
 // Global variables for ADC readings (updated by printKeyChannels)
 float ads0_values[4] = {0.0, 0.0, 0.0, 0.0}; // VTEC, ITEC, TSET, TACT
-float ads1_values[4] = {0.0, 0.0, 0.0, 0.0}; // IMON, ACTM, SETM, A1C3
+float ads1_values[4] = {0.0, 0.0, 0.0, 0.0}; // IMON, A1C1, SETM, ACTM
 int16_t ads0_raw[4] = {0, 0, 0, 0};
 int16_t ads1_raw[4] = {0, 0, 0, 0};
 float ads0_volts[4] = {0.0, 0.0, 0.0, 0.0};
@@ -208,7 +209,7 @@ bool ilkEnableOut = false;
 bool ilkTempOK = false;
 float ptcActV_A0 = 0.0;    // interlock path (10-bit, authoritative)
 float ptcSetV_A0 = 0.0;    // 10-bit
-float ptcActV_ADS = 0.0;   // ADS1 ch1 (16-bit, display only)
+float ptcActV_ADS = 0.0;   // ADS1 ch3 (16-bit, display only)
 float ptcSetV_ADS = 0.0;   // ADS1 ch2 (16-bit, display only)
 
 
@@ -919,7 +920,7 @@ void refreshPage(int page) {
         if (ch == 0) {
           strcat(line, "mA");  // IMON in milliamperes
         } else {
-          strcat(line, "mV");  // ACTM/SETM monitor mV, A1C3 raw mV
+          strcat(line, "mV");  // SETM/ACTM monitor mV, A1C1 raw mV
         }
         lcdRow(ch, line);
       }
@@ -952,7 +953,7 @@ void refreshPage(int page) {
         if (ch == 0) {
           strcat(line, "mA");  // IMON in milliamperes
         } else {
-          strcat(line, "mV");  // ACTM/SETM monitor mV, A1C3 raw mV
+          strcat(line, "mV");  // SETM/ACTM monitor mV, A1C1 raw mV
         }
         lcdRow(ch, line);
       }
@@ -1118,12 +1119,12 @@ void printKeyChannels() {
     
     if (ch == 0) { // IMON
       ads1_values[ch] = (ads1_volts[ch] / 20) * 1000;
-    } else if (ch == 1 || ch == 2) {
-      // ACTM/SETM: these channels tap the PTC monitor DIVIDER NODE
+    } else if (ch == 2 || ch == 3) {
+      // SETM/ACTM: these channels tap the PTC monitor DIVIDER NODE
       // (the raw 0-6 V monitor would exceed the +/-4.096 V GAIN_ONE
       // range), so undo the divider to report monitor mV.
       ads1_values[ch] = (ads1_volts[ch] / DIVIDER_RATIO) * 1000;
-    } else { // A1C3 spare
+    } else { // A1C1 spare
       ads1_values[ch] = ads1_volts[ch] * 1000; // Convert to mV for display
     }
   }
@@ -1131,7 +1132,7 @@ void printKeyChannels() {
   // 16-bit view of the PTC monitors -- display/logging only. The
   // interlock never trips on these: they arrive over bounded I2C calls,
   // while the independent A0 path remains authoritative.
-  ptcActV_ADS = ads1_values[1] / 1000.0;
+  ptcActV_ADS = ads1_values[3] / 1000.0;
   ptcSetV_ADS = ads1_values[2] / 1000.0;
 
   // --- Print in required order ---
@@ -1166,12 +1167,12 @@ void printKeyChannels() {
   Serial.print(",IMONV:"); Serial.print(ads1_volts[0], 4);
 
   // --- Print monitor taps / spare at the end ---
-  Serial.print(",ACTMR:"); Serial.print(ads1_raw[1]);
-  Serial.print(",ACTMV:"); Serial.print(ads1_volts[1], 4);
+  Serial.print(",ACTMR:"); Serial.print(ads1_raw[3]);
+  Serial.print(",ACTMV:"); Serial.print(ads1_volts[3], 4);
   Serial.print(",SETMR:"); Serial.print(ads1_raw[2]);
   Serial.print(",SETMV:"); Serial.print(ads1_volts[2], 4);
-  Serial.print(",A1C3R:"); Serial.print(ads1_raw[3]);
-  Serial.print(",A1C3V:"); Serial.print(ads1_volts[3], 4);
+  Serial.print(",A1C1R:"); Serial.print(ads1_raw[1]);
+  Serial.print(",A1C1V:"); Serial.print(ads1_volts[1], 4);
 
   Serial.println();
 }

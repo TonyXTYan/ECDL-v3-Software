@@ -37,3 +37,23 @@ Hardware still running v1.ino during this session (no reflash yet).
 - Confirmed D3/D4 have nothing wired to them (from earlier bench check) — no
   "other hardware" harness existed there, so no removal action was needed on
   those pins for this step.
+- [x] §4 step 3 — monitor dividers built and connected:
+      - ACT (TACT): measured 21.7k / 46.3k, tapped to Arduino A0 and
+        ADS1115 #1 (0x49) **ch3** (physical pin A3 on that breakout).
+      - SET (TSET): measured 21.7k / 47.0k, tapped to Arduino A1 and
+        ADS1115 #1 (0x49) **ch2** (physical pin A2 on that breakout).
+      - Confirmed via ADDR-pin check: the 0x49 chip (ADDR->5V) is the
+        one carrying IMON/ACT/SET; the 0x48 chip (ADDR->GND) is
+        untouched and still carries the existing TEC100L VTEC/ITEC/TSET/TACT
+        readings — no conflict between the two chips.
+- **Design deviation from the original guide**: bench wiring landed ACT on
+  ADS1 ch3 instead of the originally documented ch1, leaving ch1 (`A1C1`)
+  spare instead of ch3. Rather than rewire, **`v3-software-v2.ino` and
+  `v3-software-v2-retrofit-guide.md` were both updated to match this
+  wiring** (channel-name PROGMEM strings, `ads1_values[]` divider-undo
+  branch, `ptcActV_ADS` source index, CSV `ACTMR`/`ACTMV`/`A1C1R`/`A1C1V`
+  fields, guide §2/§3.1/§4/§5.3 text). SET on ch2 was already correct, no
+  change there. Recompiled clean with `arduino-cli compile --fqbn
+  arduino:avr:nano v3-software-v2`: 18880 B flash (61%), 1424 B RAM (69%) —
+  matches guide §1 table within rounding. Committed as firmware+doc change,
+  not yet flashed to hardware (still running v1.ino).
