@@ -57,3 +57,7 @@ Hardware still running v1.ino during this session (no reflash yet).
   arduino:avr:nano v3-software-v2`: 18880 B flash (61%), 1424 B RAM (69%) —
   matches guide §1 table within rounding. Committed as firmware+doc change,
   not yet flashed to hardware (still running v1.ino).
+- [x] §4 step 3 (cont.) — Nano-side taps landed: divider nodes also run to
+      **A0** (PTC-TACT / ACT T MON, `PIN_PTC_ACT`) and **A1** (PTC-TSET /
+      SET T MON, `PIN_PTC_SET`), per the original pin map — unaffected by
+      the ADS1 channel swap above.
