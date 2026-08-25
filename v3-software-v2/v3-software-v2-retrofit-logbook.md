@@ -61,3 +61,32 @@ Hardware still running v1.ino during this session (no reflash yet).
       **A0** (PTC-TACT / ACT T MON, `PIN_PTC_ACT`) and **A1** (PTC-TSET /
       SET T MON, `PIN_PTC_SET`), per the original pin map — unaffected by
       the ADS1 channel swap above.
+- [x] §4 step 5 — manual enable switch wired to **A2** (`PIN_PTC_MANUAL`),
+      pulldown to GND used **15k** in place of the guide's 10k. This pin is
+      read as a digital HIGH/LOW (`digitalRead`, no divider math), so the
+      substitution needs no firmware or calibration change — any pulldown
+      in this range holds a solid LOW with the switch open. No guide edit
+      needed either, since 10k there is just the recommended value, not a
+      constraint tied to a computed constant.
+- [x] §4 step 6 — PTC ENABLE wired: D9 through 1k, 10k pulldown at the PTC
+      end, as documented.
+- [x] §4 step 7 — indicator LEDs wired: D10 (green OK), D11/D12 (fault,
+      parallel).
+- [x] Updated `R_TOP_K`/`R_BOTTOM_K` in `v3-software-v2.ino` to the
+      bench-measured dividers: `R_TOP_K` 21.73 -> **21.70** (both ACT and
+      SET measured 21.7); `R_BOTTOM_K` 47.31 -> **46.65**, the average of
+      ACT's measured 46.3 and SET's measured 47.0 (the sketch shares one
+      `DIVIDER_RATIO` constant across both channels, so this is the
+      closest single-value fit). `R_PTC_OUT_K` left at 1.00 — that's the
+      PTC's own output-impedance spec, not a bench-measured resistor.
+      Recompiled clean: 18880 B flash (61%), 1424 B RAM (69%), unchanged
+      from before the edit.
+- [x] §4 step 8 — common ground confirmed across Arduino, PTC10K-CH, and
+      divider/LED grounds.
+- [ ] 5V rail measurement deferred — `ADC_REF_V` stays at the 5.000
+      placeholder for now.
+- [x] Manual switch verified at the A2 pin: reads 5V with switch ON, GND
+      with switch OFF.
+- [x] PTC ENABLE confirmed physically disconnected from the PTC10K-CH end.
+      Pre-power checklist clear (5V rail measurement excepted, deferred) —
+      ready to flash.

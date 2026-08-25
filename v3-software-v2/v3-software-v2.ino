@@ -134,9 +134,9 @@ const float ADC_REF_V = 5.000;
 //
 // PTC T MON outputs have ~1k output impedance, so the effective
 // upper resistance is 22k + 1k.
-const float R_TOP_K     = 21.73;
+const float R_TOP_K     = 21.70;
 const float R_PTC_OUT_K = 1.00;
-const float R_BOTTOM_K  = 47.31;
+const float R_BOTTOM_K  = 46.65;
 
 const float DIVIDER_RATIO =
   R_BOTTOM_K / (R_BOTTOM_K + R_TOP_K + R_PTC_OUT_K);
