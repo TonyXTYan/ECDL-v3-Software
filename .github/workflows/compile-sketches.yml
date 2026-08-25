@@ -16,7 +16,7 @@ jobs:
           - "v3-software-v2"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Compile ${{ matrix.sketch }}
         uses: arduino/compile-sketches@v1
