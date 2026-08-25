@@ -144,6 +144,22 @@ const float DIVIDER_RATIO =
 const float V_LOW  = 0.750;
 const float V_HIGH = 1.400;
 
+// Display-only diagnostics, not additional trip thresholds -- V_LOW/V_HIGH
+// above already put both of these conditions outside the OK range, so
+// ENABLE stays LOW either way. These just pick a more specific message
+// than a generic FAULT for two recognizable failure signatures:
+//
+// An open thermistor circuit reads near ADC_REF_V at the pin, which
+// after undoing the divider is ~ADC_REF_V / DIVIDER_RATIO -- around 7.4V
+// with this unit's measured resistors. 6.0V is comfortably below that
+// and comfortably above any real in-range or over-temperature reading.
+const float NTC_DISCONNECT_V = 6.0;
+
+// PTC10K-CH unpowered pulls both monitor outputs to ~0V (no bias
+// current). A live sensor circuit won't idle this close to 0 even at
+// the low end of its range.
+const float PTC_NO_POWER_V = 0.05;
+
 
 // ---------------- PTC sensor model -- UNCALIBRATED ----------------
 // Bias current is CONFIRMED at 100 uA for this unit.
@@ -743,8 +759,20 @@ void formatNumber(float value, char* buffer, int width = 6) {
 
 // Short interlock state text, shared by page 0 and page 3.
 // Longest output is 11 chars, so 'out' needs at least 12 bytes.
+//
+// The NTC-disconnected / no-power checks run ahead of the normal
+// manual/warmup/fault states: both are recognizable voltage signatures
+// (see NTC_DISCONNECT_V / PTC_NO_POWER_V) worth naming specifically
+// rather than folding into a generic FAULT, and they're informative
+// even with the manual switch off or before the median window fills.
+// Either condition already sits outside V_LOW/V_HIGH, so this is a
+// display refinement only -- ENABLE was already going to stay LOW.
 void ptcStateText(char* out) {
-  if (!ilkManualON) {
+  if (ptcActV_A0 < PTC_NO_POWER_V && ptcSetV_A0 < PTC_NO_POWER_V) {
+    strcpy(out, "PTC NO PWR");
+  } else if (ptcActV_A0 > NTC_DISCONNECT_V || ptcSetV_A0 > NTC_DISCONNECT_V) {
+    strcpy(out, "NTC DISCONN");
+  } else if (!ilkManualON) {
     strcpy(out, "MANUAL OFF");
   } else if (!ilkBufferFull) {
     strcpy(out, "WARMUP");
@@ -838,7 +866,9 @@ void refreshPage(int page) {
   // Turn LED on for entire page refresh duration
   digitalWrite(ledPin, HIGH);
   
-  // Check pause state for pages 1 and 2
+  // Check pause state: pages 1/2 freeze their moving averages; page 3
+  // uses it to pick ADS1115 (normal) vs Nano analogRead (paused) as
+  // its display source.
   isPaused = checkPauseState();
   
   if (page == 1) {
@@ -962,35 +992,42 @@ void refreshPage(int page) {
     // ============================================================
     // PTC10K-CH interlock page (replaces the deprecated TEC-8A page)
     //
-    // Left column  = A0/A1 10-bit reading (what the interlock trips on)
-    // Right column = ADS1115 16-bit reading of the same divider node
-    // A persistent disagreement between the two means a wiring or
-    // calibration problem, not noise.
+    // Display source follows the D5 pause switch: normal (HIGH) shows
+    // the ADS1115 (16-bit, higher-resolution) reading; paused (LOW)
+    // falls back to the Nano A0/A1 analogRead (10-bit). This is a
+    // display-only choice -- serviceInterlock()'s trip decision always
+    // reads A0/A1 directly and never looks at this switch. Source is
+    // labeled on row 2 since the two readings are no longer shown
+    // side-by-side (that cross-check is still available by toggling
+    // the switch and comparing the two screens).
     // ============================================================
     char line[32];
     char a[9], b[9];
     char st[14];   // ptcStateText needs >= 12 bytes
 
+    bool useADS = !isPaused;
+    float actV = useADS ? ptcActV_ADS : ptcActV_A0;
+    float setV = useADS ? ptcSetV_ADS : ptcSetV_A0;
+
     serviceInterlock();
-    formatNumber(ptcActV_A0, a, 5);
-    formatNumber(ptcActV_ADS, b, 6);
+    formatNumber(actV, a, 6);
+    formatNumber(ptcMonVoltsToC(actV), b, 7);
     strcpy(line, "ACT "); strcat(line, a); strcat(line, "V ");
-    strcat(line, b); strcat(line, "V");
+    strcat(line, b); strcat(line, "C");
     lcdRow(0, line);
 
     serviceInterlock();
-    formatNumber(ptcSetV_A0, a, 5);
-    formatNumber(ptcSetV_ADS, b, 6);
+    formatNumber(setV, a, 6);
+    formatNumber(ptcMonVoltsToC(setV), b, 7);
     strcpy(line, "SET "); strcat(line, a); strcat(line, "V ");
-    strcat(line, b); strcat(line, "V");
+    strcat(line, b); strcat(line, "C");
     lcdRow(1, line);
 
-    // Derived degC -- flagged ~UNCAL because PTC_BETA is assumed.
+    // ~UNCAL because PTC_BETA is assumed; SRC shows which reading
+    // rows 0/1 are currently derived from.
     serviceInterlock();
-    formatNumber(ptcMonVoltsToC(ptcActV_A0), a, 4);
-    formatNumber(ptcMonVoltsToC(ptcSetV_A0), b, 4);
-    strcpy(line, "T "); strcat(line, a); strcat(line, "C/");
-    strcat(line, b); strcat(line, "C ~UNCAL");
+    strcpy(line, "~UNCAL SRC:");
+    strcat(line, useADS ? "ADC" : "NANO");
     lcdRow(2, line);
 
     serviceInterlock();
