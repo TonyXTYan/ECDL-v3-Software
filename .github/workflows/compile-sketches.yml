@@ -1,0 +1,29 @@
+name: Compile sketches
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sketch:
+          - "v3-software-v1"
+          - "PTC-voltage-interlock"
+          - "v3-software-v2"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile ${{ matrix.sketch }}
+        uses: arduino/compile-sketches@v1
+        with:
+          fqbn: arduino:avr:uno
+          sketch-paths: |
+            - "${{ matrix.sketch }}"
+          libraries: |
+            - name: Adafruit ADS1X15
+            - name: LiquidCrystal I2C

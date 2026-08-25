@@ -8,7 +8,7 @@ Firmware for an ECDL (external-cavity diode laser) v3 control system, built as t
 independent Arduino sketches. There is no shared build system, package manifest, or
 test suite — each `.ino` is compiled/uploaded standalone via the Arduino IDE.
 
-- **`ECDL-v3-Software v1/v3-software-v1.ino`** — main controller: dual ADS1115 ADC
+- **`v3-software-v1/v3-software-v1.ino`** — main controller: dual ADS1115 ADC
   monitoring, 20x4 I2C LCD display, and serial bridge to an external TEC (thermoelectric
   cooler) controller.
 - **`PTC-voltage-interlock/PTC-voltage-interlock.ino`** — standalone hardware safety
@@ -17,7 +17,7 @@ test suite — each `.ino` is compiled/uploaded standalone via the Arduino IDE.
 
 ## Build / upload
 
-No `arduino-cli`/PlatformIO config exists in this repo — sketches are built and
+No PlatformIO config exists in this repo — sketches are built and
 flashed via the Arduino IDE. Required libraries (install via Library Manager) for
 the main sketch only:
 
@@ -29,7 +29,9 @@ the main sketch only:
 The interlock sketch (`PTC-voltage-interlock.ino`) uses only bundled AVR core APIs —
 no external libraries.
 
-There are no automated tests or linters; verification is hardware-in-the-loop via the
+CI (`.github/workflows/compile-sketches.yml`) compile-checks all three sketches against
+`arduino:avr:uno` on every push/PR — it catches build breakage only, not behavior.
+Functional verification is otherwise hardware-in-the-loop via the
 Serial Monitor (38400 baud on the main sketch) and observing the LCD/LEDs.
 
 ## `v3-software-v1.ino` architecture
